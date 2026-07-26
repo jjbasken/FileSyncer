@@ -1,0 +1,19 @@
+[package]
+name = "filesyncer-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+blake3 = "1.8.5"
+dirs = "6.0.0"
+filetime = "0.2.29"
+ignore = "0.4.31"
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+thiserror = "2.0.19"
+toml = "1.1.3"
+
+[dev-dependencies]
+tempfile = "3.27.0"
