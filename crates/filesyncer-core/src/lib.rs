@@ -3,8 +3,10 @@ pub mod hash;
 pub mod marker;
 pub mod profile;
 pub mod scan;
+pub mod state;
 
 pub use error::{Error, Result};
 pub use marker::MARKER_FILE;
 pub use profile::{Profile, ProfileSet};
 pub use scan::{Entry, EntryKind, Scan};
+pub use state::{StateRow, StateStore};
