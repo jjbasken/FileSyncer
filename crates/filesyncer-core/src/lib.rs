@@ -1,3 +1,4 @@
+pub mod apply;
 pub mod error;
 pub mod hash;
 pub mod marker;
