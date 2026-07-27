@@ -134,8 +134,61 @@ pub fn reconcile(
                 }
             }
 
-            // Task 10 fills in the remaining arms.
-            _ => {}
+            (Some(l), None, Some(s)) => {
+                let suspect = l.size != s.local_size || l.mtime != s.local_mtime;
+                let changed = suspect && hashes.hash(Side::Local, key)? != s.hash;
+                if changed {
+                    plan.conflicts.push(Conflict {
+                        rel_path: key.to_string(),
+                        kind: ConflictKind::EditedLocalDeletedRemote,
+                        local: Some(stat_of(l)),
+                        remote: None,
+                    });
+                } else {
+                    plan.actions.push(Action::Trash {
+                        rel_path: key.to_string(),
+                        side: Side::Local,
+                    });
+                }
+            }
+
+            (None, Some(r), Some(s)) => {
+                let suspect = r.size != s.remote_size || r.mtime != s.remote_mtime;
+                let changed = suspect && hashes.hash(Side::Remote, key)? != s.hash;
+                if changed {
+                    plan.conflicts.push(Conflict {
+                        rel_path: key.to_string(),
+                        kind: ConflictKind::EditedRemoteDeletedLocal,
+                        local: None,
+                        remote: Some(stat_of(r)),
+                    });
+                } else {
+                    plan.actions.push(Action::Trash {
+                        rel_path: key.to_string(),
+                        side: Side::Remote,
+                    });
+                }
+            }
+
+            (Some(l), None, None) => plan.actions.push(Action::Copy {
+                rel_path: key.to_string(),
+                from: Side::Local,
+                size: l.size,
+                hash: hashes.hash(Side::Local, key)?,
+            }),
+
+            (None, Some(r), None) => plan.actions.push(Action::Copy {
+                rel_path: key.to_string(),
+                from: Side::Remote,
+                size: r.size,
+                hash: hashes.hash(Side::Remote, key)?,
+            }),
+
+            (None, None, Some(_)) => plan.actions.push(Action::DropState {
+                rel_path: key.to_string(),
+            }),
+
+            (None, None, None) => unreachable!("key came from one of the three sources"),
         }
     }
 
@@ -385,7 +438,11 @@ mod tests {
                 mtime: 5,
             },
         );
-        let plan = reconcile(&local, &remote, &BTreeMap::new(), &no_hashes()).unwrap();
+        // The child `thing/inner.txt` is a genuine new-remote file (local has no
+        // such path), so the completed decision table schedules it for copy and
+        // asks for its hash.
+        let h = hashes(&[(Side::Remote, "thing/inner.txt", "hInner")]);
+        let plan = reconcile(&local, &remote, &BTreeMap::new(), &h).unwrap();
         assert!(
             plan.conflicts
                 .iter()
@@ -423,5 +480,179 @@ mod tests {
         remote.symlinks.push("link.txt".into());
         let plan = reconcile(&local, &remote, &BTreeMap::new(), &no_hashes()).unwrap();
         assert_eq!(plan.skips.len(), 2, "got: {:?}", plan.skips);
+    }
+
+    #[test]
+    fn remote_deleted_and_local_unchanged_trashes_local() {
+        let local = scan_of(&[("a.txt", 10, 100)]);
+        let state = state_of(&[("a.txt", "h1", 10, 100, 10, 200)]);
+        let plan = reconcile(&local, &Scan::default(), &state, &no_hashes()).unwrap();
+        assert_eq!(
+            plan.actions,
+            vec![Action::Trash {
+                rel_path: "a.txt".into(),
+                side: Side::Local
+            }]
+        );
+    }
+
+    #[test]
+    fn local_deleted_and_remote_unchanged_trashes_remote() {
+        let remote = scan_of(&[("a.txt", 10, 200)]);
+        let state = state_of(&[("a.txt", "h1", 10, 100, 10, 200)]);
+        let plan = reconcile(&Scan::default(), &remote, &state, &no_hashes()).unwrap();
+        assert_eq!(
+            plan.actions,
+            vec![Action::Trash {
+                rel_path: "a.txt".into(),
+                side: Side::Remote
+            }]
+        );
+    }
+
+    #[test]
+    fn remote_deleted_but_local_edited_is_a_conflict() {
+        let local = scan_of(&[("a.txt", 99, 900)]);
+        let state = state_of(&[("a.txt", "h1", 10, 100, 10, 200)]);
+        let h = hashes(&[(Side::Local, "a.txt", "hNEW")]);
+        let plan = reconcile(&local, &Scan::default(), &state, &h).unwrap();
+        assert!(plan.actions.is_empty(), "got: {:?}", plan.actions);
+        assert_eq!(
+            plan.conflicts,
+            vec![Conflict {
+                rel_path: "a.txt".into(),
+                kind: ConflictKind::EditedLocalDeletedRemote,
+                local: Some(Stat {
+                    size: 99,
+                    mtime: 900
+                }),
+                remote: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn local_deleted_but_remote_edited_is_a_conflict() {
+        let remote = scan_of(&[("a.txt", 99, 900)]);
+        let state = state_of(&[("a.txt", "h1", 10, 100, 10, 200)]);
+        let h = hashes(&[(Side::Remote, "a.txt", "hNEW")]);
+        let plan = reconcile(&Scan::default(), &remote, &state, &h).unwrap();
+        assert_eq!(
+            plan.conflicts[0].kind,
+            ConflictKind::EditedRemoteDeletedLocal
+        );
+        assert_eq!(plan.conflicts[0].local, None);
+    }
+
+    #[test]
+    fn a_suspect_but_unchanged_file_whose_peer_vanished_is_still_trashed() {
+        // mtime drifted locally, but content matches state: the remote deletion
+        // is the only real change, so propagate it rather than calling it a conflict.
+        let local = scan_of(&[("a.txt", 10, 777)]);
+        let state = state_of(&[("a.txt", "h1", 10, 100, 10, 200)]);
+        let h = hashes(&[(Side::Local, "a.txt", "h1")]);
+        let plan = reconcile(&local, &Scan::default(), &state, &h).unwrap();
+        assert_eq!(
+            plan.actions,
+            vec![Action::Trash {
+                rel_path: "a.txt".into(),
+                side: Side::Local
+            }]
+        );
+    }
+
+    #[test]
+    fn a_new_local_file_copies_to_remote() {
+        let local = scan_of(&[("new.txt", 42, 100)]);
+        let h = hashes(&[(Side::Local, "new.txt", "hN")]);
+        let plan = reconcile(&local, &Scan::default(), &BTreeMap::new(), &h).unwrap();
+        assert_eq!(
+            plan.actions,
+            vec![Action::Copy {
+                rel_path: "new.txt".into(),
+                from: Side::Local,
+                size: 42,
+                hash: "hN".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_new_remote_file_copies_to_local() {
+        let remote = scan_of(&[("new.txt", 42, 100)]);
+        let h = hashes(&[(Side::Remote, "new.txt", "hN")]);
+        let plan = reconcile(&Scan::default(), &remote, &BTreeMap::new(), &h).unwrap();
+        assert_eq!(
+            plan.actions,
+            vec![Action::Copy {
+                rel_path: "new.txt".into(),
+                from: Side::Remote,
+                size: 42,
+                hash: "hN".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn gone_from_both_sides_drops_the_state_row() {
+        let state = state_of(&[("a.txt", "h1", 10, 100, 10, 200)]);
+        let plan = reconcile(&Scan::default(), &Scan::default(), &state, &no_hashes()).unwrap();
+        assert_eq!(
+            plan.actions,
+            vec![Action::DropState {
+                rel_path: "a.txt".into()
+            }]
+        );
+        assert!(plan.is_noop(), "dropping a row touches no files");
+    }
+
+    #[test]
+    fn an_emptied_remote_schedules_deletion_of_every_tracked_path() {
+        // reconcile itself does not refuse this; Task 11's threshold check does.
+        let local = scan_of(&[("a.txt", 1, 1), ("b.txt", 1, 1), ("c.txt", 1, 1)]);
+        let state = state_of(&[
+            ("a.txt", "h", 1, 1, 1, 1),
+            ("b.txt", "h", 1, 1, 1, 1),
+            ("c.txt", "h", 1, 1, 1, 1),
+        ]);
+        let plan = reconcile(&local, &Scan::default(), &state, &no_hashes()).unwrap();
+        assert_eq!(plan.trash_count(), 3);
+    }
+
+    #[test]
+    fn a_mixed_tree_produces_every_action_kind_at_once() {
+        let local = scan_of(&[
+            ("same.txt", 10, 100),      // unchanged
+            ("edited.txt", 20, 900),    // edited locally
+            ("newlocal.txt", 5, 50),    // new local
+            ("delremote.txt", 10, 100), // remote deleted this
+        ]);
+        let remote = scan_of(&[
+            ("same.txt", 10, 200),
+            ("edited.txt", 10, 200),
+            ("newremote.txt", 7, 70),
+            ("dellocal.txt", 10, 200),
+        ]);
+        let state = state_of(&[
+            ("same.txt", "h1", 10, 100, 10, 200),
+            ("edited.txt", "h2", 10, 100, 10, 200),
+            ("delremote.txt", "h3", 10, 100, 10, 200),
+            ("dellocal.txt", "h4", 10, 100, 10, 200),
+        ]);
+        let h = hashes(&[
+            (Side::Local, "edited.txt", "hE"),
+            (Side::Local, "newlocal.txt", "hNL"),
+            (Side::Remote, "newremote.txt", "hNR"),
+        ]);
+        let plan = reconcile(&local, &remote, &state, &h).unwrap();
+
+        assert_eq!(
+            plan.copy_count(Side::Remote),
+            2,
+            "edited.txt + newlocal.txt"
+        );
+        assert_eq!(plan.copy_count(Side::Local), 1, "newremote.txt");
+        assert_eq!(plan.trash_count(), 2, "delremote.txt + dellocal.txt");
+        assert!(plan.conflicts.is_empty());
     }
 }
