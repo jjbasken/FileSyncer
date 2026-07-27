@@ -1,3 +1,8 @@
+mod args;
+mod render;
+
 fn main() {
-    println!("Hello, world!");
+    let _ = <args::Cli as clap::Parser>::parse();
+    eprintln!("not yet implemented");
+    std::process::exit(1);
 }
