@@ -12,6 +12,7 @@ pub struct StateRow {
     pub remote_mtime: i64,
 }
 
+#[derive(Debug)]
 pub struct StateStore {
     conn: rusqlite::Connection,
 }

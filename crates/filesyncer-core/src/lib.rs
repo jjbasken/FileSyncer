@@ -6,6 +6,7 @@ pub mod plan;
 pub mod profile;
 pub mod reconcile;
 pub mod scan;
+pub mod session;
 pub mod state;
 
 pub use apply::{ApplyCtx, Progress, RunSummary, apply};
@@ -17,4 +18,5 @@ pub use plan::{
 pub use profile::{Profile, ProfileSet};
 pub use reconcile::{FsHashProvider, HashProvider, reconcile};
 pub use scan::{Entry, EntryKind, Scan};
+pub use session::{Session, create_profile_roots};
 pub use state::{StateRow, StateStore};
