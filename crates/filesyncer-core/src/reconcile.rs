@@ -195,6 +195,22 @@ pub fn reconcile(
     Ok(plan)
 }
 
+/// Hashes files on the real filesystem.
+pub struct FsHashProvider {
+    pub local_root: std::path::PathBuf,
+    pub remote_root: std::path::PathBuf,
+}
+
+impl HashProvider for FsHashProvider {
+    fn hash(&self, side: Side, rel_path: &str) -> Result<String> {
+        let root = match side {
+            Side::Local => &self.local_root,
+            Side::Remote => &self.remote_root,
+        };
+        crate::hash::hash_file(&root.join(rel_path))
+    }
+}
+
 fn stat_of(e: &crate::scan::Entry) -> Stat {
     Stat {
         size: e.size,
@@ -654,5 +670,21 @@ mod tests {
         assert_eq!(plan.copy_count(Side::Local), 1, "newremote.txt");
         assert_eq!(plan.trash_count(), 2, "delremote.txt + dellocal.txt");
         assert!(plan.conflicts.is_empty());
+    }
+
+    #[test]
+    fn fs_hash_provider_reads_from_the_right_root() {
+        let local = tempfile::tempdir().unwrap();
+        let remote = tempfile::tempdir().unwrap();
+        std::fs::write(local.path().join("a.txt"), "local contents").unwrap();
+        std::fs::write(remote.path().join("a.txt"), "remote contents").unwrap();
+        let p = FsHashProvider {
+            local_root: local.path().to_path_buf(),
+            remote_root: remote.path().to_path_buf(),
+        };
+        assert_ne!(
+            p.hash(Side::Local, "a.txt").unwrap(),
+            p.hash(Side::Remote, "a.txt").unwrap()
+        );
     }
 }
