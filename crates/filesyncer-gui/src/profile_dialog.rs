@@ -7,9 +7,6 @@ use std::rc::Rc;
 
 pub fn present(aw: &Rc<AppWindow>) {
     let name_row = adw::EntryRow::builder().title("Name").build();
-    let id_row = adw::EntryRow::builder()
-        .title("Id (used for the state database and root markers)")
-        .build();
 
     let local = Rc::new(RefCell::new(None::<PathBuf>));
     let remote = Rc::new(RefCell::new(None::<PathBuf>));
@@ -25,7 +22,6 @@ pub fn present(aw: &Rc<AppWindow>) {
 
     let group = adw::PreferencesGroup::new();
     group.add(&name_row);
-    group.add(&id_row);
     group.add(&local_row);
     group.add(&remote_row);
 
@@ -47,7 +43,7 @@ pub fn present(aw: &Rc<AppWindow>) {
             if response != "add" {
                 return;
             }
-            match build_and_save(&id_row.text(), &name_row.text(), &local, &remote) {
+            match build_and_save(&name_row.text(), &local, &remote) {
                 Ok(id) => {
                     aw.reload_profiles();
                     let ok = adw::AlertDialog::new(
@@ -107,37 +103,36 @@ fn attach_chooser(
 }
 
 fn build_and_save(
-    id: &str,
     name: &str,
     local: &Rc<RefCell<Option<PathBuf>>>,
     remote: &Rc<RefCell<Option<PathBuf>>>,
 ) -> Result<String, String> {
-    let id = id.trim();
-    if id.is_empty() {
-        return Err("An id is required.".into());
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("A name is required.".into());
     }
-    if !id
+    // The name doubles as the profile id, which becomes a state-database
+    // filename and marker content, so it must stay filesystem-safe.
+    if !name
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
     {
-        return Err("Ids may contain only letters, digits, hyphens, and underscores.".into());
+        return Err("Names may contain only letters, digits, hyphens, and underscores.".into());
     }
     let local = local.borrow().clone().ok_or("Choose a local folder.")?;
     let remote = remote.borrow().clone().ok_or("Choose a remote folder.")?;
 
     let config = profile::config_path();
     let mut set = ProfileSet::load(&config).map_err(|e| e.to_string())?;
-    if set.get(id).is_some() {
-        return Err(format!("A profile with id `{id}` already exists."));
+    // Reject a clash with any existing profile's name or id — a CLI-created
+    // profile may carry a name that differs from its id.
+    if set.profiles.iter().any(|p| p.name == name || p.id == name) {
+        return Err(format!("A profile named `{name}` already exists."));
     }
 
     let new_profile = Profile {
-        id: id.to_string(),
-        name: if name.trim().is_empty() {
-            id.to_string()
-        } else {
-            name.trim().to_string()
-        },
+        id: name.to_string(),
+        name: name.to_string(),
         local,
         remote,
     };
@@ -148,5 +143,5 @@ fn build_and_save(
 
     set.profiles.push(new_profile);
     set.save(&config).map_err(|e| e.to_string())?;
-    Ok(id.to_string())
+    Ok(name.to_string())
 }
