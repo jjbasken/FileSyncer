@@ -147,7 +147,7 @@ fn show_summary(aw: &Rc<AppWindow>, result: Result<RunSummary, String>) {
                         "dialog-warning-symbolic"
                     })
                     .title(title)
-                    .description(&format!(
+                    .description(format!(
                         "{} copied, {} moved to trash.",
                         summary.copied, summary.trashed
                     ))
@@ -161,7 +161,7 @@ fn show_summary(aw: &Rc<AppWindow>, result: Result<RunSummary, String>) {
                     .build();
                 group.add(
                     &adw::ActionRow::builder()
-                        .title(&format!("{} file(s) left untouched", summary.conflicts))
+                        .title(format!("{} file(s) left untouched", summary.conflicts))
                         .build(),
                 );
                 column.append(&group);

@@ -44,7 +44,7 @@ impl AppWindow {
         for p in &self.profiles.borrow().profiles {
             let row = adw::ActionRow::builder()
                 .title(&p.name)
-                .subtitle(&p.remote.display().to_string())
+                .subtitle(p.remote.display().to_string())
                 .activatable(true)
                 .build();
             // The id is not shown, but every handler needs it.

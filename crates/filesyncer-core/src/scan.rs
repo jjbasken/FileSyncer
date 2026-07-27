@@ -45,10 +45,10 @@ pub fn scan_root(root: &Path, extra_ignore_files: &[PathBuf]) -> Result<Scan> {
         .require_git(false);
     builder.add_custom_ignore_filename(IGNORE_FILE);
     for extra in extra_ignore_files {
-        if extra.exists() {
-            if let Some(err) = builder.add_ignore(extra) {
-                return Err(Error::Config(format!("{}: {err}", extra.display())));
-            }
+        if extra.exists()
+            && let Some(err) = builder.add_ignore(extra)
+        {
+            return Err(Error::Config(format!("{}: {err}", extra.display())));
         }
     }
 

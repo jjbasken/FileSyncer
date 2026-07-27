@@ -80,10 +80,10 @@ pub fn clean_stale_temps(root: &Path) -> Result<usize> {
             };
             if file_type.is_dir() {
                 stack.push(path);
-            } else if entry.file_name().to_string_lossy().contains(TEMP_SUFFIX) {
-                if std::fs::remove_file(&path).is_ok() {
-                    removed += 1;
-                }
+            } else if entry.file_name().to_string_lossy().contains(TEMP_SUFFIX)
+                && std::fs::remove_file(&path).is_ok()
+            {
+                removed += 1;
             }
         }
     }

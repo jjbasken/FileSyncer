@@ -95,11 +95,11 @@ fn attach_chooser(
             Some(&window),
             None::<&gtk::gio::Cancellable>,
             move |result| {
-                if let Ok(file) = result {
-                    if let Some(path) = file.path() {
-                        row.set_subtitle(&path.display().to_string());
-                        *slot.borrow_mut() = Some(path);
-                    }
+                if let Ok(file) = result
+                    && let Some(path) = file.path()
+                {
+                    row.set_subtitle(&path.display().to_string());
+                    *slot.borrow_mut() = Some(path);
                 }
             },
         );
