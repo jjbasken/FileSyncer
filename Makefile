@@ -23,9 +23,13 @@ metainfodir = $(datarootdir)/metainfo
 APP_ID   = net.jjbasken.FileSyncer
 RELEASE  = target/release
 
-BINARIES = $(RELEASE)/filesyncer $(RELEASE)/filesyncer-gui
 SOURCES  = Cargo.toml Cargo.lock \
            $(shell find crates -name '*.rs' -o -name 'Cargo.toml')
+# A single stamp records a successful build. Keying the work to this (rather
+# than the binaries) avoids re-running cargo when only one crate changed:
+# cargo relinks just that binary, leaving the others' mtimes older than the
+# edited sources, which would otherwise look perpetually out of date.
+STAMP    = $(RELEASE)/.build-stamp
 
 INSTALL         = install
 INSTALL_PROGRAM = $(INSTALL) -Dm755
@@ -35,18 +39,19 @@ INSTALL_DATA    = $(INSTALL) -Dm644
 
 all: build
 
-# Phony convenience targets; the real work is keyed to the binary files below
-# so that `make && sudo make install` builds once (as you) and the install
-# step only copies files — it never re-runs cargo as root.
-build release: $(BINARIES)
+# Phony convenience targets; the real work is keyed to the stamp below so that
+# `make && sudo make install` builds once (as you) and the install step only
+# copies files — it never re-runs cargo as root.
+build release: $(STAMP)
 
-$(BINARIES) &: $(SOURCES)
+$(STAMP): $(SOURCES)
 	$(CARGO) build --release --workspace
+	@touch $@
 
 check test:
 	$(CARGO) test --workspace
 
-install: $(BINARIES)
+install: $(STAMP)
 	$(INSTALL_PROGRAM) $(RELEASE)/filesyncer     $(DESTDIR)$(bindir)/filesyncer
 	$(INSTALL_PROGRAM) $(RELEASE)/filesyncer-gui  $(DESTDIR)$(bindir)/filesyncer-gui
 	$(INSTALL_DATA) data/$(APP_ID).desktop        $(DESTDIR)$(appsdir)/$(APP_ID).desktop
