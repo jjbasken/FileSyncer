@@ -95,7 +95,7 @@ not nest) and writes a `.filesyncer-root` marker into each.
 ### Command line
 
 ```sh
-filesyncer add <id> <local-dir> <remote-dir>   # create a profile, stamp markers
+filesyncer add <name> <local-dir> <remote-dir>  # create a profile, stamp markers
 filesyncer list                                 # show configured profiles
 filesyncer sync <id> --dry-run                  # review the plan, change nothing
 filesyncer sync <id>                            # review, confirm, apply

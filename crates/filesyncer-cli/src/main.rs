@@ -25,11 +25,10 @@ fn run(cli: Cli) -> Result<i32, String> {
     match cli.command {
         Command::List => cmd_list(),
         Command::Add {
-            id,
             name,
             local,
             remote,
-        } => cmd_add(id, name, local, remote),
+        } => cmd_add(name, local, remote),
         Command::Status { profile } => cmd_status(&profile),
         Command::Sync {
             profile,
@@ -64,20 +63,33 @@ fn cmd_list() -> Result<i32, String> {
 }
 
 fn cmd_add(
-    id: String,
-    name: Option<String>,
+    name: String,
     local: std::path::PathBuf,
     remote: std::path::PathBuf,
 ) -> Result<i32, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("a name is required".into());
+    }
+    // The name doubles as the profile id, which becomes a state-database
+    // filename and marker content, so it must stay filesystem-safe.
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err("names may contain only letters, digits, hyphens, and underscores".into());
+    }
+
     let path = profile::config_path();
     let mut set = ProfileSet::load(&path).map_err(|e| e.to_string())?;
-    if set.get(&id).is_some() {
-        return Err(format!("profile `{id}` already exists"));
+    // Reject a clash with any existing profile's name or id.
+    if set.profiles.iter().any(|p| p.name == name || p.id == name) {
+        return Err(format!("a profile named `{name}` already exists"));
     }
 
     let profile = Profile {
-        name: name.unwrap_or_else(|| id.clone()),
-        id,
+        id: name.to_string(),
+        name: name.to_string(),
         local,
         remote,
     };

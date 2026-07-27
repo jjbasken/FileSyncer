@@ -28,11 +28,8 @@ pub enum Command {
     List,
     /// Create a profile and write its root markers.
     Add {
-        /// Profile id, used for the state database and root markers.
-        id: String,
-        /// Display name.
-        #[arg(long)]
-        name: Option<String>,
+        /// Profile name, also used as its id for the state database and root markers.
+        name: String,
         local: PathBuf,
         remote: PathBuf,
     },
