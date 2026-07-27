@@ -23,6 +23,10 @@ metainfodir = $(datarootdir)/metainfo
 APP_ID   = net.jjbasken.FileSyncer
 RELEASE  = target/release
 
+BINARIES = $(RELEASE)/filesyncer $(RELEASE)/filesyncer-gui
+SOURCES  = Cargo.toml Cargo.lock \
+           $(shell find crates -name '*.rs' -o -name 'Cargo.toml')
+
 INSTALL         = install
 INSTALL_PROGRAM = $(INSTALL) -Dm755
 INSTALL_DATA    = $(INSTALL) -Dm644
@@ -31,13 +35,18 @@ INSTALL_DATA    = $(INSTALL) -Dm644
 
 all: build
 
-build release:
+# Phony convenience targets; the real work is keyed to the binary files below
+# so that `make && sudo make install` builds once (as you) and the install
+# step only copies files — it never re-runs cargo as root.
+build release: $(BINARIES)
+
+$(BINARIES) &: $(SOURCES)
 	$(CARGO) build --release --workspace
 
 check test:
 	$(CARGO) test --workspace
 
-install: release
+install: $(BINARIES)
 	$(INSTALL_PROGRAM) $(RELEASE)/filesyncer     $(DESTDIR)$(bindir)/filesyncer
 	$(INSTALL_PROGRAM) $(RELEASE)/filesyncer-gui  $(DESTDIR)$(bindir)/filesyncer-gui
 	$(INSTALL_DATA) data/$(APP_ID).desktop        $(DESTDIR)$(appsdir)/$(APP_ID).desktop
