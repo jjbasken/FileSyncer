@@ -1,7 +1,8 @@
 use crate::plan_view;
 use crate::window::AppWindow;
 use adw::prelude::*;
-use filesyncer_core::{Profile, Session};
+use filesyncer_core::{Plan, Profile, Session};
+use gtk::glib;
 use std::rc::Rc;
 
 pub fn show(aw: &Rc<AppWindow>, profile: &Profile) {
@@ -45,14 +46,39 @@ pub fn show(aw: &Rc<AppWindow>, profile: &Profile) {
             status_row.set_subtitle(&subtitle);
 
             let session = Rc::new(session);
+            let profile = profile.clone();
             let aw2 = aw.clone();
             scan_button.connect_clicked(move |button| {
                 button.set_sensitive(false);
-                match session.prepare(false) {
-                    Ok(plan) => plan_view::show(&aw2, session.clone(), plan),
-                    Err(e) => show_error(&aw2, &e.to_string()),
+                button.set_label("Scanning…");
+
+                // Scanning walks both trees, so run it off the main loop to keep
+                // the window responsive. The worker opens its own Session because
+                // rusqlite connections are Send but not Sync (see run_view).
+                let (sender, receiver) = async_channel::unbounded::<Result<Plan, String>>();
+                {
+                    let profile = profile.clone();
+                    std::thread::spawn(move || {
+                        let result = (|| -> Result<Plan, String> {
+                            let worker = Session::open(&profile).map_err(|e| e.to_string())?;
+                            worker.prepare(false).map_err(|e| e.to_string())
+                        })();
+                        let _ = sender.send_blocking(result);
+                    });
                 }
-                button.set_sensitive(true);
+
+                let aw2 = aw2.clone();
+                let session = session.clone();
+                let button = button.clone();
+                glib::spawn_future_local(async move {
+                    match receiver.recv().await {
+                        Ok(Ok(plan)) => plan_view::show(&aw2, session, plan),
+                        Ok(Err(e)) => show_error(&aw2, &e),
+                        Err(_) => show_error(&aw2, "Scan worker stopped unexpectedly."),
+                    }
+                    button.set_label("Scan");
+                    button.set_sensitive(true);
+                });
             });
         }
         Err(e) => {
