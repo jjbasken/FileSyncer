@@ -1,4 +1,6 @@
+use crate::plan::{Action, Plan, Side};
 use crate::scan::TRASH_DIR;
+use crate::state::{StateRow, StateStore};
 use crate::{Error, Result};
 use std::path::{Path, PathBuf};
 
@@ -86,6 +88,208 @@ pub fn clean_stale_temps(root: &Path) -> Result<usize> {
         }
     }
     Ok(removed)
+}
+
+pub struct ApplyCtx<'a> {
+    pub local_root: &'a Path,
+    pub remote_root: &'a Path,
+    pub state: &'a StateStore,
+    pub run_stamp: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Progress {
+    Started {
+        total: usize,
+    },
+    Item {
+        index: usize,
+        total: usize,
+        rel_path: String,
+    },
+    Finished,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RunSummary {
+    pub copied: usize,
+    pub trashed: usize,
+    pub conflicts: usize,
+    pub errors: Vec<(String, String)>,
+    pub cancelled: bool,
+}
+
+impl ApplyCtx<'_> {
+    fn root(&self, side: Side) -> &Path {
+        match side {
+            Side::Local => self.local_root,
+            Side::Remote => self.remote_root,
+        }
+    }
+}
+
+fn stat_of_file(path: &Path) -> Result<crate::plan::Stat> {
+    let meta = std::fs::metadata(path).map_err(|e| Error::io(path, e))?;
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    Ok(crate::plan::Stat {
+        size: meta.len(),
+        mtime,
+    })
+}
+
+enum Outcome {
+    Copied,
+    Trashed,
+    Bookkeeping,
+}
+
+pub fn apply(
+    plan: &Plan,
+    ctx: &ApplyCtx,
+    progress: &dyn Fn(Progress),
+    cancel: &dyn Fn() -> bool,
+) -> Result<RunSummary> {
+    let mut summary = RunSummary {
+        conflicts: plan.conflicts.len(),
+        ..Default::default()
+    };
+
+    clean_stale_temps(ctx.local_root)?;
+    clean_stale_temps(ctx.remote_root)?;
+
+    let total = plan.actions.len();
+    progress(Progress::Started { total });
+
+    for (index, action) in plan.actions.iter().enumerate() {
+        if cancel() {
+            summary.cancelled = true;
+            break;
+        }
+
+        let rel_path = match action {
+            Action::Copy { rel_path, .. }
+            | Action::Trash { rel_path, .. }
+            | Action::RecordState { rel_path, .. }
+            | Action::DropState { rel_path } => rel_path.clone(),
+        };
+
+        progress(Progress::Item {
+            index,
+            total,
+            rel_path: rel_path.clone(),
+        });
+
+        // Each action commits its own state row, so an interruption leaves a
+        // database describing exactly the work that completed.
+        let outcome = match action {
+            Action::Copy {
+                rel_path,
+                from,
+                hash,
+                ..
+            } => apply_copy(ctx, rel_path, *from, hash).map(|()| Outcome::Copied),
+            Action::Trash { rel_path, side } => {
+                move_to_trash(ctx.root(*side), rel_path, &ctx.run_stamp)
+                    .and_then(|()| ctx.state.remove(rel_path))
+                    .map(|()| Outcome::Trashed)
+            }
+            Action::RecordState {
+                rel_path,
+                hash,
+                local,
+                remote,
+            } => ctx
+                .state
+                .upsert(&StateRow {
+                    rel_path: rel_path.clone(),
+                    hash: hash.clone(),
+                    local_size: local.size,
+                    local_mtime: local.mtime,
+                    remote_size: remote.size,
+                    remote_mtime: remote.mtime,
+                })
+                .map(|()| Outcome::Bookkeeping),
+            Action::DropState { rel_path } => {
+                ctx.state.remove(rel_path).map(|()| Outcome::Bookkeeping)
+            }
+        };
+
+        match outcome {
+            Ok(Outcome::Copied) => summary.copied += 1,
+            Ok(Outcome::Trashed) => summary.trashed += 1,
+            Ok(Outcome::Bookkeeping) => {}
+            Err(e) => summary.errors.push((rel_path, e.to_string())),
+        }
+    }
+
+    progress(Progress::Finished);
+    Ok(summary)
+}
+
+fn apply_copy(ctx: &ApplyCtx, rel_path: &str, from: Side, hash: &str) -> Result<()> {
+    let src = ctx.root(from).join(rel_path);
+    let dst = ctx.root(from.other()).join(rel_path);
+    copy_atomic(&src, &dst)?;
+
+    // A conflict resolved in the GUI carries no precomputed hash.
+    let hash = if hash.is_empty() {
+        crate::hash::hash_file(&src)?
+    } else {
+        hash.to_string()
+    };
+
+    let src_stat = stat_of_file(&src)?;
+    let dst_stat = stat_of_file(&dst)?;
+    let (local, remote) = match from {
+        Side::Local => (src_stat, dst_stat),
+        Side::Remote => (dst_stat, src_stat),
+    };
+
+    ctx.state.upsert(&StateRow {
+        rel_path: rel_path.to_string(),
+        hash,
+        local_size: local.size,
+        local_mtime: local.mtime,
+        remote_size: remote.size,
+        remote_mtime: remote.mtime,
+    })
+}
+
+/// A timestamp suitable for naming a trash subdirectory.
+pub fn run_stamp_now() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let days = secs.div_euclid(86_400);
+    let time = secs.rem_euclid(86_400);
+    let (y, m, d) = civil_from_days(days);
+    format!(
+        "{y:04}{m:02}{d:02}-{:02}{:02}{:02}",
+        time / 3600,
+        (time % 3600) / 60,
+        time % 60
+    )
+}
+
+/// Howard Hinnant's days-from-civil, inverted. Avoids a date-time dependency
+/// for the one place FileSyncer needs a calendar.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
 #[cfg(test)]
@@ -205,5 +409,368 @@ mod tests {
 
         assert_eq!(clean_stale_temps(dir.path()).unwrap(), 2);
         assert!(dir.path().join("keep.txt").exists());
+    }
+
+    use crate::plan::Stat;
+
+    struct Fixture {
+        _dir: tempfile::TempDir,
+        local: PathBuf,
+        remote: PathBuf,
+        state: StateStore,
+    }
+
+    fn fixture() -> Fixture {
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("local");
+        let remote = dir.path().join("remote");
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::create_dir_all(&remote).unwrap();
+        let state = StateStore::open_in_memory().unwrap();
+        Fixture {
+            _dir: dir,
+            local,
+            remote,
+            state,
+        }
+    }
+
+    impl Fixture {
+        fn ctx(&self) -> ApplyCtx<'_> {
+            ApplyCtx {
+                local_root: &self.local,
+                remote_root: &self.remote,
+                state: &self.state,
+                run_stamp: "run1".to_string(),
+            }
+        }
+        fn write_local(&self, rel: &str, contents: &str) {
+            let p = self.local.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, contents).unwrap();
+        }
+        fn write_remote(&self, rel: &str, contents: &str) {
+            let p = self.remote.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, contents).unwrap();
+        }
+    }
+
+    fn run(plan: &Plan, f: &Fixture) -> RunSummary {
+        apply(plan, &f.ctx(), &|_| {}, &|| false).unwrap()
+    }
+
+    #[test]
+    fn copy_to_remote_transfers_the_file_and_records_state() {
+        let f = fixture();
+        f.write_local("a.txt", "payload");
+        let plan = Plan {
+            actions: vec![Action::Copy {
+                rel_path: "a.txt".into(),
+                from: Side::Local,
+                size: 7,
+                hash: "precomputed".into(),
+            }],
+            ..Default::default()
+        };
+        let summary = run(&plan, &f);
+
+        assert_eq!(summary.copied, 1);
+        assert_eq!(
+            std::fs::read_to_string(f.remote.join("a.txt")).unwrap(),
+            "payload"
+        );
+        let row = &f.state.load_all().unwrap()["a.txt"];
+        assert_eq!(row.hash, "precomputed");
+        assert_eq!(row.local_size, 7);
+        assert_eq!(row.remote_size, 7);
+    }
+
+    #[test]
+    fn copy_to_local_works_in_the_other_direction() {
+        let f = fixture();
+        f.write_remote("a.txt", "from remote");
+        let plan = Plan {
+            actions: vec![Action::Copy {
+                rel_path: "a.txt".into(),
+                from: Side::Remote,
+                size: 11,
+                hash: "h".into(),
+            }],
+            ..Default::default()
+        };
+        run(&plan, &f);
+        assert_eq!(
+            std::fs::read_to_string(f.local.join("a.txt")).unwrap(),
+            "from remote"
+        );
+    }
+
+    #[test]
+    fn nested_paths_get_their_directories_created() {
+        let f = fixture();
+        f.write_local("deep/nested/a.txt", "x");
+        let plan = Plan {
+            actions: vec![Action::Copy {
+                rel_path: "deep/nested/a.txt".into(),
+                from: Side::Local,
+                size: 1,
+                hash: "h".into(),
+            }],
+            ..Default::default()
+        };
+        run(&plan, &f);
+        assert!(f.remote.join("deep/nested/a.txt").exists());
+    }
+
+    #[test]
+    fn a_resolved_conflict_with_no_precomputed_hash_gets_hashed_at_copy_time() {
+        let f = fixture();
+        f.write_local("a.txt", "payload");
+        let plan = Plan {
+            actions: vec![Action::Copy {
+                rel_path: "a.txt".into(),
+                from: Side::Local,
+                size: 7,
+                hash: String::new(),
+            }],
+            ..Default::default()
+        };
+        run(&plan, &f);
+        let row = &f.state.load_all().unwrap()["a.txt"];
+        assert_eq!(
+            row.hash,
+            crate::hash::hash_file(&f.local.join("a.txt")).unwrap()
+        );
+        assert!(!row.hash.is_empty());
+    }
+
+    #[test]
+    fn trash_moves_the_file_and_drops_the_state_row() {
+        let f = fixture();
+        f.write_local("a.txt", "bye");
+        f.state
+            .upsert(&StateRow {
+                rel_path: "a.txt".into(),
+                hash: "h".into(),
+                local_size: 3,
+                local_mtime: 1,
+                remote_size: 3,
+                remote_mtime: 1,
+            })
+            .unwrap();
+
+        let plan = Plan {
+            actions: vec![Action::Trash {
+                rel_path: "a.txt".into(),
+                side: Side::Local,
+            }],
+            ..Default::default()
+        };
+        let summary = run(&plan, &f);
+
+        assert_eq!(summary.trashed, 1);
+        assert!(!f.local.join("a.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(f.local.join(TRASH_DIR).join("run1/a.txt")).unwrap(),
+            "bye"
+        );
+        assert!(f.state.load_all().unwrap().is_empty());
+    }
+
+    #[test]
+    fn record_state_writes_a_row_without_touching_files() {
+        let f = fixture();
+        let plan = Plan {
+            actions: vec![Action::RecordState {
+                rel_path: "a.txt".into(),
+                hash: "h9".into(),
+                local: Stat {
+                    size: 20,
+                    mtime: 900,
+                },
+                remote: Stat {
+                    size: 20,
+                    mtime: 901,
+                },
+            }],
+            ..Default::default()
+        };
+        let summary = run(&plan, &f);
+        assert_eq!(summary.copied, 0);
+        let row = &f.state.load_all().unwrap()["a.txt"];
+        assert_eq!(row.hash, "h9");
+        assert_eq!(row.remote_mtime, 901);
+    }
+
+    #[test]
+    fn drop_state_removes_the_row() {
+        let f = fixture();
+        f.state
+            .upsert(&StateRow {
+                rel_path: "a.txt".into(),
+                hash: "h".into(),
+                local_size: 1,
+                local_mtime: 1,
+                remote_size: 1,
+                remote_mtime: 1,
+            })
+            .unwrap();
+        let plan = Plan {
+            actions: vec![Action::DropState {
+                rel_path: "a.txt".into(),
+            }],
+            ..Default::default()
+        };
+        run(&plan, &f);
+        assert!(f.state.load_all().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_failing_file_is_recorded_but_the_run_continues() {
+        let f = fixture();
+        f.write_local("good.txt", "ok");
+        // "missing.txt" is in the plan but absent on disk.
+        let plan = Plan {
+            actions: vec![
+                Action::Copy {
+                    rel_path: "missing.txt".into(),
+                    from: Side::Local,
+                    size: 1,
+                    hash: "h".into(),
+                },
+                Action::Copy {
+                    rel_path: "good.txt".into(),
+                    from: Side::Local,
+                    size: 2,
+                    hash: "h".into(),
+                },
+            ],
+            ..Default::default()
+        };
+        let summary = run(&plan, &f);
+
+        assert_eq!(summary.copied, 1, "the good file still transferred");
+        assert_eq!(summary.errors.len(), 1);
+        assert_eq!(summary.errors[0].0, "missing.txt");
+        assert!(f.remote.join("good.txt").exists());
+    }
+
+    #[test]
+    fn a_failed_file_leaves_no_state_row_so_the_next_run_retries() {
+        let f = fixture();
+        let plan = Plan {
+            actions: vec![Action::Copy {
+                rel_path: "missing.txt".into(),
+                from: Side::Local,
+                size: 1,
+                hash: "h".into(),
+            }],
+            ..Default::default()
+        };
+        run(&plan, &f);
+        assert!(f.state.load_all().unwrap().is_empty());
+    }
+
+    #[test]
+    fn cancelling_stops_early_and_keeps_completed_work() {
+        let f = fixture();
+        f.write_local("a.txt", "one");
+        f.write_local("b.txt", "two");
+        let plan = Plan {
+            actions: vec![
+                Action::Copy {
+                    rel_path: "a.txt".into(),
+                    from: Side::Local,
+                    size: 3,
+                    hash: "h".into(),
+                },
+                Action::Copy {
+                    rel_path: "b.txt".into(),
+                    from: Side::Local,
+                    size: 3,
+                    hash: "h".into(),
+                },
+            ],
+            ..Default::default()
+        };
+        let seen = std::cell::Cell::new(0usize);
+        let summary = apply(&plan, &f.ctx(), &|_| {}, &|| {
+            seen.set(seen.get() + 1);
+            seen.get() > 1 // allow the first item, cancel before the second
+        })
+        .unwrap();
+
+        assert!(summary.cancelled);
+        assert_eq!(summary.copied, 1);
+        assert!(f.remote.join("a.txt").exists());
+        assert!(!f.remote.join("b.txt").exists());
+        assert_eq!(
+            f.state.load_all().unwrap().len(),
+            1,
+            "state must reflect exactly the work that finished"
+        );
+    }
+
+    #[test]
+    fn progress_brackets_the_run_and_reports_every_item() {
+        let f = fixture();
+        f.write_local("a.txt", "one");
+        let plan = Plan {
+            actions: vec![Action::Copy {
+                rel_path: "a.txt".into(),
+                from: Side::Local,
+                size: 3,
+                hash: "h".into(),
+            }],
+            ..Default::default()
+        };
+        let events = std::cell::RefCell::new(Vec::new());
+        apply(&plan, &f.ctx(), &|p| events.borrow_mut().push(p), &|| false).unwrap();
+
+        let events = events.into_inner();
+        assert_eq!(events.first(), Some(&Progress::Started { total: 1 }));
+        assert_eq!(events.last(), Some(&Progress::Finished));
+        assert!(events.iter().any(|e| matches!(
+            e, Progress::Item { rel_path, .. } if rel_path == "a.txt"
+        )));
+    }
+
+    #[test]
+    fn unresolved_conflicts_are_counted_and_never_acted_on() {
+        let f = fixture();
+        f.write_local("a.txt", "local");
+        f.write_remote("a.txt", "remote");
+        let plan = Plan {
+            conflicts: vec![crate::plan::Conflict {
+                rel_path: "a.txt".into(),
+                kind: crate::plan::ConflictKind::BothEdited,
+                local: Some(Stat { size: 5, mtime: 1 }),
+                remote: Some(Stat { size: 6, mtime: 2 }),
+            }],
+            ..Default::default()
+        };
+        let summary = run(&plan, &f);
+
+        assert_eq!(summary.conflicts, 1);
+        assert_eq!(
+            std::fs::read_to_string(f.local.join("a.txt")).unwrap(),
+            "local"
+        );
+        assert_eq!(
+            std::fs::read_to_string(f.remote.join("a.txt")).unwrap(),
+            "remote"
+        );
+        assert!(
+            f.state.load_all().unwrap().is_empty(),
+            "conflict rows stay untouched"
+        );
+    }
+
+    #[test]
+    fn run_stamp_is_sortable_and_filename_safe() {
+        let s = run_stamp_now();
+        assert_eq!(s.len(), 15, "expected YYYYMMDD-HHMMSS, got {s}");
+        assert!(s.chars().all(|c| c.is_ascii_digit() || c == '-'), "got {s}");
     }
 }

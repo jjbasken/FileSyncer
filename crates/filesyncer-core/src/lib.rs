@@ -8,6 +8,7 @@ pub mod reconcile;
 pub mod scan;
 pub mod state;
 
+pub use apply::{ApplyCtx, Progress, RunSummary, apply};
 pub use error::{Error, Result};
 pub use marker::MARKER_FILE;
 pub use plan::{
