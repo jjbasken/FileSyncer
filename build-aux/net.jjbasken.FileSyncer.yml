@@ -1,0 +1,59 @@
+# Flatpak manifest for FileSyncer.
+#
+# Build (run from the repo root):
+#   python3 build-aux/gen-cargo-sources.py           # refresh vendored crates
+#   flatpak install flathub org.gnome.Platform//49 org.gnome.Sdk//49 \
+#       org.freedesktop.Sdk.Extension.rust-stable//25.08
+#   flatpak-builder --user --install --force-clean \
+#       build build-aux/net.jjbasken.FileSyncer.yml
+#   flatpak run net.jjbasken.FileSyncer
+#
+# The build is network-isolated, so all crates are vendored via
+# build-aux/cargo-sources.json (regenerate it whenever Cargo.lock changes).
+id: net.jjbasken.FileSyncer
+runtime: org.gnome.Platform
+runtime-version: '49'
+sdk: org.gnome.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: filesyncer-gui
+
+finish-args:
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri
+  # The whole point of the app is syncing user directories and mounted shares.
+  - --filesystem=home
+  - --filesystem=/mnt
+  - --filesystem=/media
+  - --filesystem=/run/media
+
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin
+  env:
+    CARGO_HOME: /run/build/filesyncer/cargo
+
+modules:
+  - name: filesyncer
+    buildsystem: simple
+    build-commands:
+      - cargo --offline fetch --manifest-path Cargo.toml --verbose
+      - cargo --offline build --release --verbose
+      - install -Dm755 target/release/filesyncer -t /app/bin
+      - install -Dm755 target/release/filesyncer-gui -t /app/bin
+      - install -Dm644 data/net.jjbasken.FileSyncer.desktop
+          -t /app/share/applications
+      - install -Dm644 data/icons/net.jjbasken.FileSyncer.svg
+          /app/share/icons/hicolor/scalable/apps/net.jjbasken.FileSyncer.svg
+      - install -Dm644 data/net.jjbasken.FileSyncer.metainfo.xml
+          -t /app/share/metainfo
+    sources:
+      - type: dir
+        path: ..
+        skip:
+          - .git
+          - .flatpak-builder
+          - build
+          - target
+      - cargo-sources.json

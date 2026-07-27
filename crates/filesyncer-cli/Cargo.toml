@@ -5,6 +5,12 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+# The user-facing command is `filesyncer`; the crate keeps its `-cli` suffix to
+# stay distinct from `filesyncer-gui` in the workspace.
+[[bin]]
+name = "filesyncer"
+path = "src/main.rs"
+
 [dependencies]
 clap = { version = "4.6.4", features = ["derive"] }
 filesyncer-core = { version = "0.1.0", path = "../filesyncer-core" }

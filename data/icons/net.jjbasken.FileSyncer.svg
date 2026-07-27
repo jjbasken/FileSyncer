@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="128" height="128" viewBox="0 0 128 128" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3584e4"/>
+      <stop offset="1" stop-color="#1a5fb4"/>
+    </linearGradient>
+    <linearGradient id="folder" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#e8eef6"/>
+    </linearGradient>
+  </defs>
+
+  <!-- rounded app tile -->
+  <rect x="8" y="8" width="112" height="112" rx="26" fill="url(#bg)"/>
+  <rect x="8" y="8" width="112" height="112" rx="26" fill="none" stroke="#154c94" stroke-width="1" opacity="0.5"/>
+
+  <!-- back folder -->
+  <g opacity="0.55">
+    <path fill="url(#folder)" d="M38 40h16l7 8h21a6 6 0 0 1 6 6v26a6 6 0 0 1-6 6H38a6 6 0 0 1-6-6V46a6 6 0 0 1 6-6z"/>
+  </g>
+
+  <!-- front folder -->
+  <path fill="url(#folder)" d="M30 52h16l7 8h29a6 6 0 0 1 6 6v26a6 6 0 0 1-6 6H30a6 6 0 0 1-6-6V58a6 6 0 0 1 6-6z"/>
+
+  <!-- circular sync arrows -->
+  <g fill="none" stroke="#1a5fb4" stroke-width="6" stroke-linecap="round">
+    <path d="M52 84a13 13 0 0 1 22-9"/>
+    <path d="M76 76a13 13 0 0 1-22 9"/>
+  </g>
+  <path fill="#1a5fb4" d="M74 68l3.5 9-9.5-1.5z"/>
+  <path fill="#1a5fb4" d="M54 92l-3.5-9 9.5 1.5z"/>
+</svg>

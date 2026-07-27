@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=FileSyncer
+GenericName=File Synchroniser
+Comment=Sync files between a local directory and a mounted network share
+Exec=filesyncer-gui
+Icon=net.jjbasken.FileSyncer
+Terminal=false
+Categories=Utility;GTK;Archiving;
+Keywords=sync;synchronise;backup;files;folder;nas;share;
+StartupNotify=true
+StartupWMClass=net.jjbasken.FileSyncer

@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>net.jjbasken.FileSyncer</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+
+  <name>FileSyncer</name>
+  <summary>Sync a local directory with a mounted network share</summary>
+
+  <description>
+    <p>
+      FileSyncer keeps a local directory and a mounted network share in step in
+      both directions. It reviews every change before touching a file, flags
+      conflicts instead of silently overwriting, and routes deletions through a
+      trash directory so nothing is lost.
+    </p>
+    <p>Features:</p>
+    <ul>
+      <li>Bidirectional sync with a scan, review, and apply cycle</li>
+      <li>Conflicts are flagged for you to resolve, never auto-merged</li>
+      <li>Deletions go to a per-run trash directory and stay recoverable</li>
+      <li>A safeguard aborts rather than mistaking an unmounted share for a mass deletion</li>
+      <li>Per-directory ignore rules via <code>.syncignore</code></li>
+      <li>A graphical app and a matching <code>filesyncer</code> command line tool</li>
+    </ul>
+  </description>
+
+  <launchable type="desktop-id">net.jjbasken.FileSyncer.desktop</launchable>
+
+  <categories>
+    <category>Utility</category>
+    <category>Archiving</category>
+  </categories>
+
+  <keywords>
+    <keyword>sync</keyword>
+    <keyword>backup</keyword>
+    <keyword>files</keyword>
+    <keyword>nas</keyword>
+  </keywords>
+
+  <content_rating type="oars-1.1"/>
+
+  <developer id="net.jjbasken">
+    <name>Jeremy Basken</name>
+  </developer>
+
+  <url type="homepage">https://github.com/jjbasken/FileSyncer</url>
+  <url type="bugtracker">https://github.com/jjbasken/FileSyncer/issues</url>
+
+  <releases>
+    <release version="0.1.0" date="2026-07-26">
+      <description>
+        <p>Initial release: bidirectional sync engine, GTK4 app, and command line tool.</p>
+      </description>
+    </release>
+  </releases>
+</component>
