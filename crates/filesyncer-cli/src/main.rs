@@ -3,7 +3,8 @@ mod render;
 
 use args::{Cli, Command};
 use clap::Parser;
-use filesyncer_core::{Profile, ProfileSet, Session, create_profile_roots, profile};
+use filesyncer_core::{Profile, ProfileSet, Reporter, Session, create_profile_roots, profile};
+use std::io::IsTerminal;
 
 const EXIT_OK: i32 = 0;
 const EXIT_ERROR: i32 = 1;
@@ -126,7 +127,18 @@ fn cmd_status(id: &str) -> Result<i32, String> {
 fn cmd_sync(id: &str, yes: bool, dry_run: bool, force: bool) -> Result<i32, String> {
     let profile = load_profile(id)?;
     let session = Session::open(&profile).map_err(|e| e.to_string())?;
-    let plan = session.prepare(force).map_err(|e| e.to_string())?;
+
+    let scan = std::cell::RefCell::new(render::ScanReporter::new(
+        std::io::stdout(),
+        std::io::stdout().is_terminal(),
+    ));
+    // Ctrl-C remains the way to abort a command line scan, which is safe
+    // because a scan writes nothing.
+    let sink = |p| scan.borrow_mut().handle(p);
+    let plan = session
+        .prepare(force, &Reporter::new(&sink, &|| false))
+        .map_err(|e| e.to_string())?
+        .expect("the CLI never cancels a scan");
 
     print!("{}", render::plan_summary(&plan));
 
@@ -152,20 +164,17 @@ fn cmd_sync(id: &str, yes: bool, dry_run: bool, force: bool) -> Result<i32, Stri
     }
 
     let total = std::cell::Cell::new(0usize);
+    let apply_progress = |p| match p {
+        filesyncer_core::Progress::Started { total: n, .. } => total.set(n.unwrap_or(0)),
+        filesyncer_core::Progress::Item {
+            index, rel_path, ..
+        } => {
+            println!("[{}/{}] {rel_path}", index + 1, total.get());
+        }
+        filesyncer_core::Progress::Finished { .. } => {}
+    };
     let summary = session
-        .run(
-            &plan,
-            &|p| match p {
-                filesyncer_core::Progress::Started { total: n } => total.set(n),
-                filesyncer_core::Progress::Item {
-                    index, rel_path, ..
-                } => {
-                    println!("[{}/{}] {rel_path}", index + 1, total.get());
-                }
-                filesyncer_core::Progress::Finished => {}
-            },
-            &|| false,
-        )
+        .run(&plan, &Reporter::new(&apply_progress, &|| false))
         .map_err(|e| e.to_string())?;
 
     print!("{}", render::run_summary(&summary));

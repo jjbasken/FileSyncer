@@ -1,4 +1,5 @@
 use crate::plan::{Action, Plan, Side};
+use crate::progress::{Phase, Reporter};
 use crate::scan::TRASH_DIR;
 use crate::state::{StateRow, StateStore};
 use crate::{Error, Result};
@@ -97,19 +98,6 @@ pub struct ApplyCtx<'a> {
     pub run_stamp: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Progress {
-    Started {
-        total: usize,
-    },
-    Item {
-        index: usize,
-        total: usize,
-        rel_path: String,
-    },
-    Finished,
-}
-
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RunSummary {
     pub copied: usize,
@@ -148,12 +136,7 @@ enum Outcome {
     Bookkeeping,
 }
 
-pub fn apply(
-    plan: &Plan,
-    ctx: &ApplyCtx,
-    progress: &dyn Fn(Progress),
-    cancel: &dyn Fn() -> bool,
-) -> Result<RunSummary> {
+pub fn apply(plan: &Plan, ctx: &ApplyCtx, reporter: &Reporter) -> Result<RunSummary> {
     let mut summary = RunSummary {
         conflicts: plan.conflicts.len(),
         ..Default::default()
@@ -163,10 +146,12 @@ pub fn apply(
     clean_stale_temps(ctx.remote_root)?;
 
     let total = plan.actions.len();
-    progress(Progress::Started { total });
+    reporter.started(Phase::Apply, Some(total));
+
+    let mut done = 0usize;
 
     for (index, action) in plan.actions.iter().enumerate() {
-        if cancel() {
+        if reporter.cancelled() {
             summary.cancelled = true;
             break;
         }
@@ -178,11 +163,8 @@ pub fn apply(
             | Action::DropState { rel_path } => rel_path.clone(),
         };
 
-        progress(Progress::Item {
-            index,
-            total,
-            rel_path: rel_path.clone(),
-        });
+        reporter.item(Phase::Apply, index, &rel_path);
+        done = index + 1;
 
         // Each action commits its own state row, so an interruption leaves a
         // database describing exactly the work that completed.
@@ -227,7 +209,7 @@ pub fn apply(
         }
     }
 
-    progress(Progress::Finished);
+    reporter.finished(Phase::Apply, done);
     Ok(summary)
 }
 
@@ -295,6 +277,7 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::progress::Progress;
 
     #[test]
     fn copy_creates_the_destination_with_identical_contents() {
@@ -457,7 +440,7 @@ mod tests {
     }
 
     fn run(plan: &Plan, f: &Fixture) -> RunSummary {
-        apply(plan, &f.ctx(), &|_| {}, &|| false).unwrap()
+        apply(plan, &f.ctx(), &Reporter::silent()).unwrap()
     }
 
     #[test]
@@ -695,10 +678,15 @@ mod tests {
             ..Default::default()
         };
         let seen = std::cell::Cell::new(0usize);
-        let summary = apply(&plan, &f.ctx(), &|_| {}, &|| {
-            seen.set(seen.get() + 1);
-            seen.get() > 1 // allow the first item, cancel before the second
-        })
+        let sink = |_| {};
+        let summary = apply(
+            &plan,
+            &f.ctx(),
+            &Reporter::new(&sink, &|| {
+                seen.set(seen.get() + 1);
+                seen.get() > 1 // allow the first item, cancel before the second
+            }),
+        )
         .unwrap();
 
         assert!(summary.cancelled);
@@ -726,11 +714,25 @@ mod tests {
             ..Default::default()
         };
         let events = std::cell::RefCell::new(Vec::new());
-        apply(&plan, &f.ctx(), &|p| events.borrow_mut().push(p), &|| false).unwrap();
+        let sink = |p| events.borrow_mut().push(p);
+        apply(&plan, &f.ctx(), &Reporter::new(&sink, &|| false)).unwrap();
 
         let events = events.into_inner();
-        assert_eq!(events.first(), Some(&Progress::Started { total: 1 }));
-        assert_eq!(events.last(), Some(&Progress::Finished));
+        assert_eq!(
+            events.first(),
+            Some(&Progress::Started {
+                phase: Phase::Apply,
+                total: Some(1)
+            }),
+            "the work is counted up front, so the total is known"
+        );
+        assert_eq!(
+            events.last(),
+            Some(&Progress::Finished {
+                phase: Phase::Apply,
+                count: 1
+            })
+        );
         assert!(events.iter().any(|e| matches!(
             e, Progress::Item { rel_path, .. } if rel_path == "a.txt"
         )));

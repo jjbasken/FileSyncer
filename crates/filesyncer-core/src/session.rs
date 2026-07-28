@@ -1,7 +1,8 @@
-use crate::apply::{ApplyCtx, Progress, RunSummary, apply, run_stamp_now};
+use crate::apply::{ApplyCtx, RunSummary, apply, run_stamp_now};
 use crate::marker;
 use crate::plan::Plan;
 use crate::profile::Profile;
+use crate::progress::{Phase, Reporter};
 use crate::reconcile::{FsHashProvider, reconcile};
 use crate::scan::{IGNORE_FILE, scan_root};
 use crate::state::StateStore;
@@ -35,42 +36,61 @@ impl Session {
         &self.profile
     }
 
-    pub fn prepare(&self, force: bool) -> Result<Plan> {
+    /// Scan both roots and reconcile them into a plan.
+    ///
+    /// Returns `Ok(None)` when the scan was cancelled. Cancellation is an absent
+    /// plan rather than an `Error` because nothing failed and nothing was
+    /// written; an error would force every caller to tell a cancelled scan apart
+    /// from a broken one.
+    pub fn prepare(&self, force: bool, reporter: &Reporter) -> Result<Option<Plan>> {
         marker::verify_marker(&self.profile.local, &self.profile.id)?;
         marker::verify_marker(&self.profile.remote, &self.profile.id)?;
 
         let local_ignore = self.profile.local.join(IGNORE_FILE);
         let remote_ignore = self.profile.remote.join(IGNORE_FILE);
 
-        let local = scan_root(&self.profile.local, std::slice::from_ref(&remote_ignore))?;
-        let remote = scan_root(&self.profile.remote, std::slice::from_ref(&local_ignore))?;
+        let Some(local) = scan_root(
+            &self.profile.local,
+            std::slice::from_ref(&remote_ignore),
+            Phase::ScanLocal,
+            reporter,
+        )?
+        else {
+            return Ok(None);
+        };
+        let Some(remote) = scan_root(
+            &self.profile.remote,
+            std::slice::from_ref(&local_ignore),
+            Phase::ScanRemote,
+            reporter,
+        )?
+        else {
+            return Ok(None);
+        };
 
         let state = self.state.load_all()?;
         let hashes = FsHashProvider {
             local_root: self.profile.local.clone(),
             remote_root: self.profile.remote.clone(),
         };
-        let plan = reconcile(&local, &remote, &state, &hashes)?;
+        let Some(plan) = reconcile(&local, &remote, &state, &hashes, reporter)? else {
+            return Ok(None);
+        };
 
         if !force {
             plan.check_deletion_threshold(state.len())?;
         }
-        Ok(plan)
+        Ok(Some(plan))
     }
 
-    pub fn run(
-        &self,
-        plan: &Plan,
-        progress: &dyn Fn(Progress),
-        cancel: &dyn Fn() -> bool,
-    ) -> Result<RunSummary> {
+    pub fn run(&self, plan: &Plan, reporter: &Reporter) -> Result<RunSummary> {
         let ctx = ApplyCtx {
             local_root: &self.profile.local,
             remote_root: &self.profile.remote,
             state: &self.state,
             run_stamp: run_stamp_now(),
         };
-        let summary = apply(plan, &ctx, progress, cancel)?;
+        let summary = apply(plan, &ctx, reporter)?;
 
         // Only a run that finished represents a synchronised moment in time.
         if !summary.cancelled {
@@ -141,6 +161,15 @@ mod tests {
         }
     }
 
+    /// Prepare with no progress reporting, for the tests that only care about
+    /// the resulting plan.
+    fn prepared(session: &Session, force: bool) -> Plan {
+        session
+            .prepare(force, &Reporter::silent())
+            .unwrap()
+            .expect("a silent reporter never cancels")
+    }
+
     #[test]
     fn create_profile_roots_writes_both_markers() {
         let f = fixture();
@@ -176,7 +205,7 @@ mod tests {
         let f = fixture();
         f.write("local", "a.txt", "aaa");
         f.write("remote", "b.txt", "bbb");
-        let plan = f.session().prepare(false).unwrap();
+        let plan = prepared(&f.session(), false);
         assert_eq!(plan.copy_count(crate::Side::Remote), 1);
         assert_eq!(plan.copy_count(crate::Side::Local), 1);
     }
@@ -185,7 +214,7 @@ mod tests {
     fn markers_are_never_part_of_a_plan() {
         let f = fixture();
         f.write("local", "a.txt", "aaa");
-        let plan = f.session().prepare(false).unwrap();
+        let plan = prepared(&f.session(), false);
         assert_eq!(plan.actions.len(), 1, "got: {:?}", plan.actions);
     }
 
@@ -195,7 +224,7 @@ mod tests {
         f.write("remote", IGNORE_FILE, "*.tmp\n");
         f.write("local", "keep.txt", "k");
         f.write("local", "scratch.tmp", "s");
-        let plan = f.session().prepare(false).unwrap();
+        let plan = prepared(&f.session(), false);
         let paths: Vec<_> = plan
             .actions
             .iter()
@@ -219,14 +248,14 @@ mod tests {
             f.write("remote", &format!("f{i}.txt"), "x");
         }
         let session = f.session();
-        let plan = session.prepare(false).unwrap();
-        session.run(&plan, &|_| {}, &|| false).unwrap();
+        let plan = prepared(&session, false);
+        session.run(&plan, &Reporter::silent()).unwrap();
 
         // Simulate the share going away: delete everything on the remote.
         for i in 0..10 {
             std::fs::remove_file(f.profile.remote.join(format!("f{i}.txt"))).unwrap();
         }
-        let err = session.prepare(false).unwrap_err();
+        let err = session.prepare(false, &Reporter::silent()).unwrap_err();
         assert!(
             matches!(err, crate::Error::DeletionThreshold { .. }),
             "got: {err:?}"
@@ -241,12 +270,12 @@ mod tests {
             f.write("remote", &format!("f{i}.txt"), "x");
         }
         let session = f.session();
-        let plan = session.prepare(false).unwrap();
-        session.run(&plan, &|_| {}, &|| false).unwrap();
+        let plan = prepared(&session, false);
+        session.run(&plan, &Reporter::silent()).unwrap();
         for i in 0..10 {
             std::fs::remove_file(f.profile.remote.join(format!("f{i}.txt"))).unwrap();
         }
-        let plan = session.prepare(true).unwrap();
+        let plan = prepared(&session, true);
         assert_eq!(plan.trash_count(), 10);
     }
 
@@ -256,8 +285,8 @@ mod tests {
         f.write("local", "a.txt", "x");
         let session = f.session();
         assert_eq!(session.last_sync().unwrap(), None);
-        let plan = session.prepare(false).unwrap();
-        session.run(&plan, &|_| {}, &|| false).unwrap();
+        let plan = prepared(&session, false);
+        session.run(&plan, &Reporter::silent()).unwrap();
         assert!(session.last_sync().unwrap().is_some());
     }
 
@@ -266,12 +295,67 @@ mod tests {
         let f = fixture();
         f.write("local", "a.txt", "x");
         let session = f.session();
-        let plan = session.prepare(false).unwrap();
-        session.run(&plan, &|_| {}, &|| true).unwrap();
+        let plan = prepared(&session, false);
+        session
+            .run(&plan, &Reporter::new(&|_| {}, &|| true))
+            .unwrap();
         assert_eq!(
             session.last_sync().unwrap(),
             None,
             "an interrupted run has not synced"
         );
+    }
+
+    #[test]
+    fn a_cancelled_scan_yields_no_plan() {
+        let f = fixture();
+        f.write("local", "a.txt", "x");
+        let sink = |_| {};
+        let plan = f
+            .session()
+            .prepare(false, &Reporter::new(&sink, &|| true))
+            .unwrap();
+        assert!(plan.is_none());
+    }
+
+    #[test]
+    fn a_cancelled_scan_leaves_both_roots_and_the_state_untouched() {
+        let f = fixture();
+        f.write("local", "a.txt", "x");
+        f.write("remote", "b.txt", "y");
+        let session = f.session();
+
+        let before = (tree(&f.profile.local), tree(&f.profile.remote));
+        let sink = |_| {};
+        session
+            .prepare(false, &Reporter::new(&sink, &|| true))
+            .unwrap();
+
+        assert_eq!(
+            (tree(&f.profile.local), tree(&f.profile.remote)),
+            before,
+            "a scan writes nothing, cancelled or not"
+        );
+        assert_eq!(session.tracked_count().unwrap(), 0);
+        assert_eq!(session.last_sync().unwrap(), None);
+    }
+
+    /// Every file under `root`, as sorted (relative path, contents) pairs.
+    fn tree(root: &Path) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else {
+                    let rel = path.strip_prefix(root).unwrap().display().to_string();
+                    out.push((rel, std::fs::read_to_string(&path).unwrap_or_default()));
+                }
+            }
+        }
+        out.sort();
+        out
     }
 }

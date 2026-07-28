@@ -1,6 +1,6 @@
 use crate::window::AppWindow;
 use adw::prelude::*;
-use filesyncer_core::{Plan, Progress, RunSummary, Session};
+use filesyncer_core::{Plan, Progress, Reporter, RunSummary, Session};
 use gtk::glib;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -65,13 +65,13 @@ pub fn show(aw: &Rc<AppWindow>, session: Rc<Session>, plan: Plan) {
         std::thread::spawn(move || {
             let result = (|| -> Result<RunSummary, String> {
                 let worker_session = Session::open(&profile).map_err(|e| e.to_string())?;
+                let forward = |p| {
+                    let _ = sender.send_blocking(Message::Progress(p));
+                };
                 worker_session
                     .run(
                         &plan,
-                        &|p| {
-                            let _ = sender.send_blocking(Message::Progress(p));
-                        },
-                        &|| cancelled.load(Ordering::Relaxed),
+                        &Reporter::new(&forward, &|| cancelled.load(Ordering::Relaxed)),
                     )
                     .map_err(|e| e.to_string())
             })();
@@ -84,10 +84,12 @@ pub fn show(aw: &Rc<AppWindow>, session: Rc<Session>, plan: Plan) {
         let mut total = 0usize;
         while let Ok(message) = receiver.recv().await {
             match message {
-                Message::Progress(Progress::Started { total: n }) => {
-                    total = n;
+                // Applying always knows how much work it has, so the total is
+                // present; treat an absent one as zero rather than assuming.
+                Message::Progress(Progress::Started { total: n, .. }) => {
+                    total = n.unwrap_or(0);
                     bar.set_fraction(0.0);
-                    bar.set_text(Some(&format!("0 / {n}")));
+                    bar.set_text(Some(&format!("0 / {total}")));
                 }
                 Message::Progress(Progress::Item {
                     index, rel_path, ..
@@ -99,7 +101,7 @@ pub fn show(aw: &Rc<AppWindow>, session: Rc<Session>, plan: Plan) {
                     bar.set_text(Some(&format!("{done} / {total}")));
                     current.set_label(&rel_path);
                 }
-                Message::Progress(Progress::Finished) => {
+                Message::Progress(Progress::Finished { .. }) => {
                     bar.set_fraction(1.0);
                 }
                 Message::Done(result) => {

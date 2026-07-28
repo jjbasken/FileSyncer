@@ -2,6 +2,7 @@ mod plan_view;
 mod profile_dialog;
 mod profile_page;
 mod run_view;
+mod scan_view;
 mod window;
 
 use adw::prelude::*;

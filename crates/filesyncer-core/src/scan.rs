@@ -1,3 +1,4 @@
+use crate::progress::{Phase, Reporter};
 use crate::{Error, Result, marker::MARKER_FILE};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -32,7 +33,17 @@ pub struct Scan {
     pub errors: Vec<(String, String)>,
 }
 
-pub fn scan_root(root: &Path, extra_ignore_files: &[PathBuf]) -> Result<Scan> {
+/// Walk `root`, reporting under `phase`. The phase is a parameter because only
+/// the caller knows whether a given root is the local or the remote side.
+///
+/// Returns `Ok(None)` when the walk was cancelled. A scan writes nothing, so a
+/// cancelled one is an absent result rather than an error.
+pub fn scan_root(
+    root: &Path,
+    extra_ignore_files: &[PathBuf],
+    phase: Phase,
+    reporter: &Reporter,
+) -> Result<Option<Scan>> {
     let mut builder = ignore::WalkBuilder::new(root);
     builder
         .hidden(false)
@@ -54,7 +65,15 @@ pub fn scan_root(root: &Path, extra_ignore_files: &[PathBuf]) -> Result<Scan> {
 
     let mut scan = Scan::default();
 
+    // A walk cannot know how many files it will find, so the total is absent
+    // and frontends show a count-up rather than a percentage.
+    reporter.started(phase, None);
+
     for result in builder.build() {
+        if reporter.cancelled() {
+            return Ok(None);
+        }
+
         let entry = match result {
             Ok(e) => e,
             Err(e) => {
@@ -87,6 +106,7 @@ pub fn scan_root(root: &Path, extra_ignore_files: &[PathBuf]) -> Result<Scan> {
 
         match entry.metadata() {
             Ok(meta) => {
+                reporter.item(phase, scan.files.len(), &rel_path);
                 scan.files.insert(
                     rel_path.clone(),
                     Entry {
@@ -101,7 +121,8 @@ pub fn scan_root(root: &Path, extra_ignore_files: &[PathBuf]) -> Result<Scan> {
         }
     }
 
-    Ok(scan)
+    reporter.finished(phase, scan.files.len());
+    Ok(Some(scan))
 }
 
 fn rel_to_string(rel: &Path) -> String {
@@ -130,10 +151,25 @@ fn mtime_secs(meta: &std::fs::Metadata) -> i64 {
 mod tests {
     use super::*;
 
+    use crate::progress::Progress;
+
     fn touch(root: &Path, rel: &str, contents: &str) {
         let p = root.join(rel);
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         std::fs::write(p, contents).unwrap();
+    }
+
+    /// Scan with no progress reporting, for the tests that only care about the
+    /// resulting tree.
+    fn scan(root: &Path, extra_ignore_files: &[PathBuf]) -> Scan {
+        scan_root(
+            root,
+            extra_ignore_files,
+            Phase::ScanLocal,
+            &Reporter::silent(),
+        )
+        .unwrap()
+        .expect("a silent reporter never cancels")
     }
 
     #[test]
@@ -141,7 +177,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         touch(dir.path(), "a.txt", "a");
         touch(dir.path(), "sub/b.txt", "b");
-        let scan = scan_root(dir.path(), &[]).unwrap();
+        let scan = scan(dir.path(), &[]);
         let keys: Vec<_> = scan.files.keys().cloned().collect();
         assert_eq!(keys, vec!["a.txt".to_string(), "sub/b.txt".to_string()]);
     }
@@ -150,7 +186,7 @@ mod tests {
     fn records_size_and_kind() {
         let dir = tempfile::tempdir().unwrap();
         touch(dir.path(), "a.txt", "hello");
-        let scan = scan_root(dir.path(), &[]).unwrap();
+        let scan = scan(dir.path(), &[]);
         let e = &scan.files["a.txt"];
         assert_eq!(e.size, 5);
         assert_eq!(e.kind, EntryKind::File);
@@ -161,7 +197,7 @@ mod tests {
     fn records_directories_separately_from_files() {
         let dir = tempfile::tempdir().unwrap();
         touch(dir.path(), "sub/b.txt", "b");
-        let scan = scan_root(dir.path(), &[]).unwrap();
+        let scan = scan(dir.path(), &[]);
         assert!(scan.dirs.contains("sub"));
         assert!(!scan.files.contains_key("sub"));
     }
@@ -170,7 +206,7 @@ mod tests {
     fn root_itself_is_not_listed_as_a_directory() {
         let dir = tempfile::tempdir().unwrap();
         touch(dir.path(), "a.txt", "a");
-        let scan = scan_root(dir.path(), &[]).unwrap();
+        let scan = scan(dir.path(), &[]);
         assert!(!scan.dirs.contains(""), "root leaked in as empty path");
     }
 
@@ -179,7 +215,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         touch(dir.path(), "real.txt", "r");
         std::os::unix::fs::symlink("real.txt", dir.path().join("link.txt")).unwrap();
-        let scan = scan_root(dir.path(), &[]).unwrap();
+        let scan = scan(dir.path(), &[]);
         assert_eq!(scan.symlinks, vec!["link.txt".to_string()]);
         assert!(!scan.files.contains_key("link.txt"));
     }
@@ -190,7 +226,7 @@ mod tests {
         touch(dir.path(), MARKER_FILE, "documents");
         touch(dir.path(), &format!("{TRASH_DIR}/2026/old.txt"), "x");
         touch(dir.path(), "keep.txt", "k");
-        let scan = scan_root(dir.path(), &[]).unwrap();
+        let scan = scan(dir.path(), &[]);
         let keys: Vec<_> = scan.files.keys().cloned().collect();
         assert_eq!(keys, vec!["keep.txt".to_string()]);
         assert!(!scan.dirs.iter().any(|d| d.starts_with(TRASH_DIR)));
@@ -203,7 +239,7 @@ mod tests {
         touch(dir.path(), "keep.txt", "k");
         touch(dir.path(), "scratch.tmp", "s");
         touch(dir.path(), "build/out.bin", "o");
-        let scan = scan_root(dir.path(), &[]).unwrap();
+        let scan = scan(dir.path(), &[]);
         let keys: Vec<_> = scan.files.keys().cloned().collect();
         assert_eq!(keys, vec![IGNORE_FILE.to_string(), "keep.txt".to_string()]);
     }
@@ -214,7 +250,7 @@ mod tests {
         touch(dir.path(), IGNORE_FILE, "*.log\n!keep.log\n");
         touch(dir.path(), "drop.log", "d");
         touch(dir.path(), "keep.log", "k");
-        let scan = scan_root(dir.path(), &[]).unwrap();
+        let scan = scan(dir.path(), &[]);
         assert!(scan.files.contains_key("keep.log"));
         assert!(!scan.files.contains_key("drop.log"));
     }
@@ -227,7 +263,7 @@ mod tests {
         std::fs::write(&other_ignore, "*.bak\n").unwrap();
         touch(dir.path(), "keep.txt", "k");
         touch(dir.path(), "old.bak", "b");
-        let scan = scan_root(dir.path(), &[other_ignore]).unwrap();
+        let scan = scan(dir.path(), &[other_ignore]);
         assert!(scan.files.contains_key("keep.txt"));
         assert!(!scan.files.contains_key("old.bak"));
     }
@@ -236,8 +272,121 @@ mod tests {
     fn hidden_files_are_synced_by_default() {
         let dir = tempfile::tempdir().unwrap();
         touch(dir.path(), ".bashrc", "x");
-        let scan = scan_root(dir.path(), &[]).unwrap();
+        let scan = scan(dir.path(), &[]);
         assert!(scan.files.contains_key(".bashrc"));
+    }
+
+    #[test]
+    fn progress_brackets_the_walk_and_reports_every_file() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(dir.path(), "a.txt", "a");
+        touch(dir.path(), "sub/b.txt", "b");
+
+        let events = std::cell::RefCell::new(Vec::new());
+        let sink = |p| events.borrow_mut().push(p);
+        let scan = scan_root(
+            dir.path(),
+            &[],
+            Phase::ScanRemote,
+            &Reporter::new(&sink, &|| false),
+        )
+        .unwrap()
+        .unwrap();
+        let events = events.into_inner();
+
+        assert_eq!(
+            events.first(),
+            Some(&Progress::Started {
+                phase: Phase::ScanRemote,
+                total: None
+            }),
+            "a walk cannot know its size, so the total must be absent"
+        );
+        assert_eq!(
+            events.last(),
+            Some(&Progress::Finished {
+                phase: Phase::ScanRemote,
+                count: scan.files.len()
+            })
+        );
+
+        let items: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                Progress::Item { rel_path, .. } => Some(rel_path.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(items.len(), scan.files.len());
+        assert!(items.contains(&"a.txt".to_string()), "got: {items:?}");
+        assert!(items.contains(&"sub/b.txt".to_string()), "got: {items:?}");
+    }
+
+    #[test]
+    fn item_indices_count_up_from_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..5 {
+            touch(dir.path(), &format!("f{i}.txt"), "x");
+        }
+        let indices = std::cell::RefCell::new(Vec::new());
+        let sink = |p| {
+            if let Progress::Item { index, .. } = p {
+                indices.borrow_mut().push(index);
+            }
+        };
+        scan_root(
+            dir.path(),
+            &[],
+            Phase::ScanLocal,
+            &Reporter::new(&sink, &|| false),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(indices.into_inner(), vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn cancelling_mid_walk_yields_no_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..20 {
+            touch(dir.path(), &format!("f{i}.txt"), "x");
+        }
+        let seen = std::cell::Cell::new(0usize);
+        let sink = |_| {};
+        let result = scan_root(
+            dir.path(),
+            &[],
+            Phase::ScanLocal,
+            &Reporter::new(&sink, &|| {
+                seen.set(seen.get() + 1);
+                seen.get() > 3
+            }),
+        )
+        .unwrap();
+        assert!(result.is_none(), "a cancelled walk has no result to report");
+    }
+
+    #[test]
+    fn a_cancelled_walk_leaves_the_tree_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(dir.path(), "a.txt", "a");
+        let before: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        let sink = |_| {};
+        scan_root(
+            dir.path(),
+            &[],
+            Phase::ScanLocal,
+            &Reporter::new(&sink, &|| true),
+        )
+        .unwrap();
+        let after: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(before, after);
     }
 
     #[test]
@@ -245,7 +394,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         touch(dir.path(), ".gitignore", "secret.txt\n");
         touch(dir.path(), "secret.txt", "s");
-        let scan = scan_root(dir.path(), &[]).unwrap();
+        let scan = scan(dir.path(), &[]);
         assert!(
             scan.files.contains_key("secret.txt"),
             "only .syncignore should filter a sync"

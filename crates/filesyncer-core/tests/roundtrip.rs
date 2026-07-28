@@ -1,4 +1,4 @@
-use filesyncer_core::{Profile, Session, Side, create_profile_roots};
+use filesyncer_core::{Profile, Reporter, Session, Side, create_profile_roots};
 use std::path::{Path, PathBuf};
 
 struct World {
@@ -39,9 +39,17 @@ impl World {
     /// Scan, apply, and return the summary.
     fn sync(&self) -> filesyncer_core::RunSummary {
         let s = self.session();
-        let plan = s.prepare(false).unwrap();
-        s.run(&plan, &|_| {}, &|| false).unwrap()
+        let plan = prepared(&s, false);
+        s.run(&plan, &Reporter::silent()).unwrap()
     }
+}
+
+/// Prepare with no progress reporting.
+fn prepared(session: &Session, force: bool) -> filesyncer_core::Plan {
+    session
+        .prepare(force, &Reporter::silent())
+        .unwrap()
+        .expect("a silent reporter never cancels")
 }
 
 fn assert_trees_match(a: &Path, b: &Path) {
@@ -94,7 +102,7 @@ fn a_second_run_immediately_after_the_first_plans_nothing() {
     w.write(w.remote("b.txt"), "beta");
     w.sync();
 
-    let plan = w.session().prepare(false).unwrap();
+    let plan = prepared(&w.session(), false);
     assert!(
         plan.actions.is_empty(),
         "sync must be idempotent; got: {:?}",
@@ -114,15 +122,15 @@ fn mtime_drift_on_the_remote_causes_no_transfer() {
     filetime::set_file_mtime(w.remote("a.txt"), shifted).unwrap();
 
     let s = w.session();
-    let plan = s.prepare(false).unwrap();
+    let plan = prepared(&s, false);
     assert!(
         plan.is_noop(),
         "drift must not transfer; got: {:?}",
         plan.actions
     );
 
-    s.run(&plan, &|_| {}, &|| false).unwrap();
-    let plan = s.prepare(false).unwrap();
+    s.run(&plan, &Reporter::silent()).unwrap();
+    let plan = prepared(&s, false);
     assert!(plan.actions.is_empty(), "state should now be settled");
 }
 
@@ -179,9 +187,9 @@ fn concurrent_edits_are_flagged_and_neither_side_is_touched() {
     w.write(w.remote("a.txt"), "remote version");
 
     let s = w.session();
-    let plan = s.prepare(false).unwrap();
+    let plan = prepared(&s, false);
     assert_eq!(plan.conflicts.len(), 1);
-    s.run(&plan, &|_| {}, &|| false).unwrap();
+    s.run(&plan, &Reporter::silent()).unwrap();
 
     assert_eq!(
         std::fs::read_to_string(w.local("a.txt")).unwrap(),
@@ -202,7 +210,7 @@ fn an_unresolved_conflict_reappears_on_every_run() {
     w.write(w.remote("a.txt"), "remote version");
     w.sync();
 
-    let plan = w.session().prepare(false).unwrap();
+    let plan = prepared(&w.session(), false);
     assert_eq!(
         plan.conflicts.len(),
         1,
@@ -219,15 +227,15 @@ fn resolving_a_conflict_converges_the_trees() {
     w.write(w.remote("a.txt"), "remote version");
 
     let s = w.session();
-    let mut plan = s.prepare(false).unwrap();
+    let mut plan = prepared(&s, false);
     plan.resolve_conflict("a.txt", Side::Local).unwrap();
-    s.run(&plan, &|_| {}, &|| false).unwrap();
+    s.run(&plan, &Reporter::silent()).unwrap();
 
     assert_eq!(
         std::fs::read_to_string(w.remote("a.txt")).unwrap(),
         "local version"
     );
-    let plan = s.prepare(false).unwrap();
+    let plan = prepared(&s, false);
     assert!(
         plan.actions.is_empty(),
         "resolution should settle the state"
@@ -270,7 +278,7 @@ fn deleting_the_state_database_re_baselines_without_data_loss() {
 
     std::fs::remove_file(w.dir.path().join("state.db")).unwrap();
 
-    let plan = w.session().prepare(false).unwrap();
+    let plan = prepared(&w.session(), false);
     assert!(plan.trash_count() == 0, "a re-baseline must never delete");
     assert_eq!(plan.conflicts.len(), 1, "only the genuinely differing file");
     assert_eq!(plan.conflicts[0].rel_path, "differs.txt");
@@ -296,7 +304,7 @@ fn symlinks_are_skipped_and_reported_rather_than_synced() {
     w.write(w.local("real.txt"), "r");
     std::os::unix::fs::symlink("real.txt", w.local("link.txt")).unwrap();
 
-    let plan = w.session().prepare(false).unwrap();
+    let plan = prepared(&w.session(), false);
     assert!(plan.skips.iter().any(|s| s.rel_path == "link.txt"));
     w.sync();
     assert!(!w.remote("link.txt").exists());
@@ -317,7 +325,7 @@ fn a_thousand_files_converge_and_then_settle() {
     assert!(summary.errors.is_empty());
     assert_trees_match(&w.profile.local, &w.profile.remote);
 
-    let plan = w.session().prepare(false).unwrap();
+    let plan = prepared(&w.session(), false);
     assert!(
         plan.actions.is_empty(),
         "large tree must also be idempotent"
