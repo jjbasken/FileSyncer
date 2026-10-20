@@ -1,5 +1,9 @@
 //! The progress vocabulary shared by every long-running phase.
 
+/// How long a phase that waits on worker threads may go between checks for
+/// cancellation, so one slow file cannot make Cancel feel unresponsive.
+pub(crate) const CANCEL_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// Which part of a sync is reporting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
@@ -62,6 +66,12 @@ impl<'a> Reporter<'a> {
 
     pub fn cancelled(&self) -> bool {
         (self.cancel)()
+    }
+
+    /// Pass on an event produced elsewhere, such as by a scan running on
+    /// another thread with a reporter of its own.
+    pub(crate) fn emit(&self, event: Progress) {
+        (self.progress)(event);
     }
 
     pub fn started(&self, phase: Phase, total: Option<usize>) {

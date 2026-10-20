@@ -1,7 +1,10 @@
-use crate::progress::{Phase, Reporter};
+use crate::progress::{CANCEL_POLL, Phase, Reporter};
 use crate::{Error, Result, marker::MARKER_FILE};
+use ignore::WalkState;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 
 pub const TRASH_DIR: &str = ".filesyncer-trash";
 pub const IGNORE_FILE: &str = ".syncignore";
@@ -68,61 +71,123 @@ pub fn scan_root(
     // A walk cannot know how many files it will find, so the total is absent
     // and frontends show a count-up rather than a percentage.
     reporter.started(phase, None);
-
-    for result in builder.build() {
-        if reporter.cancelled() {
-            return Ok(None);
-        }
-
-        let entry = match result {
-            Ok(e) => e,
-            Err(e) => {
-                scan.errors.push((String::new(), e.to_string()));
-                continue;
-            }
-        };
-
-        let Ok(rel) = entry.path().strip_prefix(root) else {
-            continue;
-        };
-        let rel_path = rel_to_string(rel);
-        if rel_path.is_empty() || is_reserved(&rel_path) {
-            continue;
-        }
-
-        let file_type = match entry.file_type() {
-            Some(ft) => ft,
-            None => continue,
-        };
-
-        if file_type.is_symlink() {
-            scan.symlinks.push(rel_path);
-            continue;
-        }
-        if file_type.is_dir() {
-            scan.dirs.insert(rel_path);
-            continue;
-        }
-
-        match entry.metadata() {
-            Ok(meta) => {
-                reporter.item(phase, scan.files.len(), &rel_path);
-                scan.files.insert(
-                    rel_path.clone(),
-                    Entry {
-                        rel_path,
-                        kind: EntryKind::File,
-                        size: meta.len(),
-                        mtime: mtime_secs(&meta),
-                    },
-                );
-            }
-            Err(e) => scan.errors.push((rel_path, e.to_string())),
-        }
+    if reporter.cancelled() {
+        return Ok(None);
     }
+
+    // The walk runs on a pool of threads, so that directory listings and
+    // stats — each a round trip on a network share — overlap. This thread
+    // owns the `Reporter`, which is not thread-safe, and assembles the scan.
+    let stop = AtomicBool::new(false);
+    let (tx, rx) = mpsc::channel::<Found>();
+    let walker = builder.build_parallel();
+
+    let cancelled = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            walker.run(|| {
+                let tx = tx.clone();
+                let stop = &stop;
+                Box::new(move |result| visit(root, result, stop, &tx))
+            });
+            // The walk is over once `run` returns; dropping the last sender
+            // tells the loop below.
+            drop(tx);
+        });
+
+        loop {
+            match rx.recv_timeout(CANCEL_POLL) {
+                Ok(Found::File(rel_path, entry)) => {
+                    reporter.item(phase, scan.files.len(), &rel_path);
+                    scan.files.insert(rel_path, entry);
+                }
+                Ok(Found::Dir(rel_path)) => {
+                    scan.dirs.insert(rel_path);
+                }
+                Ok(Found::Symlink(rel_path)) => scan.symlinks.push(rel_path),
+                Ok(Found::Error(rel_path, message)) => scan.errors.push((rel_path, message)),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => return false,
+            }
+            if reporter.cancelled() {
+                stop.store(true, Ordering::Relaxed);
+                return true;
+            }
+        }
+    });
+    if cancelled {
+        return Ok(None);
+    }
+
+    // Threads finish in no particular order; keep the lists stable.
+    scan.symlinks.sort();
+    scan.errors.sort();
 
     reporter.finished(phase, scan.files.len());
     Ok(Some(scan))
+}
+
+/// What a walker thread found at one path.
+enum Found {
+    File(String, Entry),
+    Dir(String),
+    Symlink(String),
+    Error(String, String),
+}
+
+/// Classify one walk result and send it to the assembling thread.
+fn visit(
+    root: &Path,
+    result: std::result::Result<ignore::DirEntry, ignore::Error>,
+    stop: &AtomicBool,
+    tx: &mpsc::Sender<Found>,
+) -> WalkState {
+    if stop.load(Ordering::Relaxed) {
+        return WalkState::Quit;
+    }
+
+    let found = match result {
+        Err(e) => Found::Error(String::new(), e.to_string()),
+        Ok(entry) => {
+            let Ok(rel) = entry.path().strip_prefix(root) else {
+                return WalkState::Continue;
+            };
+            let rel_path = rel_to_string(rel);
+            if rel_path.is_empty() {
+                return WalkState::Continue;
+            }
+            // `Skip` keeps the walk out of the trash directory altogether.
+            if is_reserved(&rel_path) {
+                return WalkState::Skip;
+            }
+            let Some(file_type) = entry.file_type() else {
+                return WalkState::Continue;
+            };
+
+            if file_type.is_symlink() {
+                Found::Symlink(rel_path)
+            } else if file_type.is_dir() {
+                Found::Dir(rel_path)
+            } else {
+                match entry.metadata() {
+                    Ok(meta) => Found::File(
+                        rel_path.clone(),
+                        Entry {
+                            rel_path,
+                            kind: EntryKind::File,
+                            size: meta.len(),
+                            mtime: mtime_secs(&meta),
+                        },
+                    ),
+                    Err(e) => Found::Error(rel_path, e.to_string()),
+                }
+            }
+        }
+    };
+
+    if tx.send(found).is_err() {
+        return WalkState::Quit;
+    }
+    WalkState::Continue
 }
 
 fn rel_to_string(rel: &Path) -> String {

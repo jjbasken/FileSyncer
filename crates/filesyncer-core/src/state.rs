@@ -75,6 +75,18 @@ impl StateStore {
         Ok(out)
     }
 
+    /// Open a transaction, so the writes until `commit` cost one sync, not
+    /// one each.
+    pub fn begin(&self) -> Result<()> {
+        self.conn.execute_batch("BEGIN")?;
+        Ok(())
+    }
+
+    pub fn commit(&self) -> Result<()> {
+        self.conn.execute_batch("COMMIT")?;
+        Ok(())
+    }
+
     pub fn upsert(&self, row: &StateRow) -> Result<()> {
         self.conn.execute(
             "INSERT INTO entry
@@ -192,6 +204,20 @@ mod tests {
     fn removing_an_absent_row_is_not_an_error() {
         let s = StateStore::open_in_memory().unwrap();
         s.remove("ghost.txt").unwrap();
+    }
+
+    #[test]
+    fn writes_inside_a_transaction_are_visible_after_commit() {
+        let s = StateStore::open_in_memory().unwrap();
+        s.begin().unwrap();
+        s.upsert(&row("a.txt")).unwrap();
+        s.remove("a.txt").unwrap();
+        s.upsert(&row("b.txt")).unwrap();
+        s.commit().unwrap();
+        assert_eq!(
+            s.load_all().unwrap().keys().cloned().collect::<Vec<_>>(),
+            vec!["b.txt".to_string()]
+        );
     }
 
     #[test]

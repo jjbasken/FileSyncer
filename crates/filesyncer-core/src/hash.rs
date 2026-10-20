@@ -3,10 +3,19 @@ use std::path::Path;
 
 /// BLAKE3 of a file's contents, as lowercase hex.
 pub fn hash_file(path: &Path) -> Result<String> {
-    let mut file = std::fs::File::open(path).map_err(|e| Error::io(path, e))?;
+    let file = std::fs::File::open(path).map_err(|e| Error::io(path, e))?;
     let mut hasher = blake3::Hasher::new();
-    std::io::copy(&mut file, &mut hasher).map_err(|e| Error::io(path, e))?;
-    Ok(hasher.finalize().to_hex().to_string())
+    // `update_reader` reads in 64 KiB blocks, wide enough for BLAKE3's SIMD to
+    // hash many chunks at once; `std::io::copy`'s 8 KiB blocks are not. Memory
+    // mapping would be faster still, but a file truncated while mapped kills the
+    // process with SIGBUS, and these files may be in use.
+    hasher.update_reader(file).map_err(|e| Error::io(path, e))?;
+    Ok(to_hex(hasher))
+}
+
+/// The lowercase-hex form every hash in the state database takes.
+pub fn to_hex(hasher: blake3::Hasher) -> String {
+    hasher.finalize().to_hex().to_string()
 }
 
 #[cfg(test)]

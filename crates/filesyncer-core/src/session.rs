@@ -2,12 +2,14 @@ use crate::apply::{ApplyCtx, RunSummary, apply, run_stamp_now};
 use crate::marker;
 use crate::plan::Plan;
 use crate::profile::Profile;
-use crate::progress::{Phase, Reporter};
+use crate::progress::{CANCEL_POLL, Phase, Progress, Reporter};
 use crate::reconcile::{FsHashProvider, reconcile};
-use crate::scan::{IGNORE_FILE, scan_root};
+use crate::scan::{IGNORE_FILE, Scan, scan_root};
 use crate::state::StateStore;
 use crate::{Result, profile};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 
 #[derive(Debug)]
 pub struct Session {
@@ -46,25 +48,7 @@ impl Session {
         marker::verify_marker(&self.profile.local, &self.profile.id)?;
         marker::verify_marker(&self.profile.remote, &self.profile.id)?;
 
-        let local_ignore = self.profile.local.join(IGNORE_FILE);
-        let remote_ignore = self.profile.remote.join(IGNORE_FILE);
-
-        let Some(local) = scan_root(
-            &self.profile.local,
-            std::slice::from_ref(&remote_ignore),
-            Phase::ScanLocal,
-            reporter,
-        )?
-        else {
-            return Ok(None);
-        };
-        let Some(remote) = scan_root(
-            &self.profile.remote,
-            std::slice::from_ref(&local_ignore),
-            Phase::ScanRemote,
-            reporter,
-        )?
-        else {
+        let Some((local, remote)) = self.scan_both(reporter)? else {
             return Ok(None);
         };
 
@@ -81,6 +65,80 @@ impl Session {
             plan.check_deletion_threshold(state.len())?;
         }
         Ok(Some(plan))
+    }
+
+    /// Scan the two roots at the same time, so that a slow side (usually the
+    /// remote share) is walked while the local disk is.
+    ///
+    /// Frontends expect one phase at a time, so only the local scan reports
+    /// live. The remote scan's events queue up and are passed on once the
+    /// local phase has finished: by then its walk is often done or nearly so.
+    fn scan_both(&self, reporter: &Reporter) -> Result<Option<(Scan, Scan)>> {
+        let local_ignore = self.profile.local.join(IGNORE_FILE);
+        let remote_ignore = self.profile.remote.join(IGNORE_FILE);
+
+        // Set when the user cancels or the local scan fails, to stop the
+        // remote walk early.
+        let stop = AtomicBool::new(false);
+        let (tx, rx) = mpsc::channel::<Progress>();
+
+        // Borrowed apart from `self`, whose database connection is not `Sync`.
+        let remote_root = &self.profile.remote;
+
+        std::thread::scope(|scope| {
+            let remote = scope.spawn(|| {
+                let sink = move |p| {
+                    let _ = tx.send(p);
+                };
+                let cancel = || stop.load(Ordering::Relaxed);
+                scan_root(
+                    remote_root,
+                    std::slice::from_ref(&local_ignore),
+                    Phase::ScanRemote,
+                    &Reporter::new(&sink, &cancel),
+                )
+            });
+
+            let forward = |p| reporter.emit(p);
+            let cancel = || {
+                let cancelled = reporter.cancelled();
+                if cancelled {
+                    stop.store(true, Ordering::Relaxed);
+                }
+                cancelled
+            };
+            let local = scan_root(
+                &self.profile.local,
+                std::slice::from_ref(&remote_ignore),
+                Phase::ScanLocal,
+                &Reporter::new(&forward, &cancel),
+            );
+            let local = match local {
+                Ok(Some(scan)) => scan,
+                other => {
+                    stop.store(true, Ordering::Relaxed);
+                    return other.map(|_| None);
+                }
+            };
+
+            // Replay the remote scan's events, live from here on, until its
+            // reporter is dropped at the end of the walk.
+            loop {
+                match rx.recv_timeout(CANCEL_POLL) {
+                    Ok(event) => reporter.emit(event),
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+                if cancel() {
+                    return Ok(None);
+                }
+            }
+
+            let remote = remote
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))?;
+            Ok(remote.map(|remote| (local, remote)))
+        })
     }
 
     pub fn run(&self, plan: &Plan, reporter: &Reporter) -> Result<RunSummary> {
@@ -338,6 +396,43 @@ mod tests {
         );
         assert_eq!(session.tracked_count().unwrap(), 0);
         assert_eq!(session.last_sync().unwrap(), None);
+    }
+
+    #[test]
+    fn concurrent_scans_still_report_one_phase_at_a_time() {
+        let f = fixture();
+        for i in 0..50 {
+            f.write("local", &format!("l{i}.txt"), "l");
+            f.write("remote", &format!("r{i}.txt"), "r");
+        }
+        let events = std::cell::RefCell::new(Vec::new());
+        let sink = |p| events.borrow_mut().push(p);
+        f.session()
+            .prepare(false, &Reporter::new(&sink, &|| false))
+            .unwrap()
+            .unwrap();
+
+        let phases: Vec<Phase> = events
+            .into_inner()
+            .into_iter()
+            .map(|e| match e {
+                Progress::Started { phase, .. }
+                | Progress::Item { phase, .. }
+                | Progress::Finished { phase, .. } => phase,
+            })
+            .collect();
+        let mut runs = phases.clone();
+        runs.dedup();
+        assert_eq!(
+            runs,
+            vec![Phase::ScanLocal, Phase::ScanRemote, Phase::Compare],
+            "phases must not interleave"
+        );
+        assert_eq!(
+            phases.iter().filter(|p| **p == Phase::ScanRemote).count(),
+            52,
+            "every remote file reported, plus Started and Finished"
+        );
     }
 
     /// Every file under `root`, as sorted (relative path, contents) pairs.

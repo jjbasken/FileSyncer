@@ -257,7 +257,6 @@ mod tests {
             rel_path: rel.into(),
             from,
             size,
-            hash: "h".into(),
         }
     }
 
