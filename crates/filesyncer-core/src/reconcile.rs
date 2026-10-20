@@ -1,13 +1,21 @@
 use crate::plan::{Action, Conflict, ConflictKind, Plan, Side, Skip, SkipReason, Stat};
-use crate::progress::{Phase, Reporter};
-use crate::scan::Scan;
+use crate::progress::{CANCEL_POLL, Phase, Reporter};
+use crate::scan::{Entry, Scan};
 use crate::state::StateRow;
 use crate::{Error, Result};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc;
+
+/// Upper bound on hashing threads. Past this, a spinning disk spends its time
+/// seeking between files and a network share gains little more overlap.
+const MAX_HASH_THREADS: usize = 8;
 
 /// Supplies content hashes on demand. Injected so the decision logic itself
 /// performs no I/O and every branch is testable without a filesystem.
-pub trait HashProvider {
+///
+/// `Sync` because hashes are requested from several threads at once.
+pub trait HashProvider: Sync {
     fn hash(&self, side: Side, rel_path: &str) -> Result<String>;
 }
 
@@ -23,6 +31,37 @@ impl HashProvider for MapHashProvider {
             .ok_or_else(|| Error::Config(format!("test hash missing for {side:?} {rel_path}")))
     }
 }
+
+/// Which sides of a path must be hashed before it can be decided.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Needs {
+    local: bool,
+    remote: bool,
+}
+
+impl Needs {
+    const NONE: Needs = Needs {
+        local: false,
+        remote: false,
+    };
+    const BOTH: Needs = Needs {
+        local: true,
+        remote: true,
+    };
+
+    fn any(self) -> bool {
+        self.local || self.remote
+    }
+
+    fn sides(self) -> impl Iterator<Item = Side> {
+        [(self.local, Side::Local), (self.remote, Side::Remote)]
+            .into_iter()
+            .filter_map(|(needed, side)| needed.then_some(side))
+    }
+}
+
+/// Hashes read ahead of the decisions, keyed by side and path.
+type Hashes<'k> = HashMap<(Side, &'k str), String>;
 
 /// Returns `Ok(None)` when the comparison was cancelled.
 pub fn reconcile(
@@ -42,209 +81,295 @@ pub fn reconcile(
     keys.extend(remote.files.keys().map(String::as_str));
     keys.extend(state.keys().map(String::as_str));
 
-    // Hashing is the only expensive part of reconciliation, and which paths
-    // need it is decided by size and mtime alone — a pure read of the scans and
-    // the state map. So a pre-pass can count them, making this phase the one
-    // that reports a real n/total.
-    let total = keys
+    // Hashing is the only expensive part of reconciliation, and which hashes
+    // are needed is decided by size and mtime alone — a pure read of the scans
+    // and the state map. So a pre-pass lists them, which gives this phase a
+    // real n/total and lets every file be read in parallel before any
+    // decision is made. The decisions themselves then perform no I/O.
+    let jobs: Vec<(&str, Needs)> = keys
         .iter()
-        .filter(|key| needs_hash(key, local, remote, state))
-        .count();
-    reporter.started(Phase::Compare, Some(total));
+        .filter_map(|&key| {
+            let needs = needs(key, local, remote, state);
+            needs.any().then_some((key, needs))
+        })
+        .collect();
 
-    let mut compared = 0usize;
+    let Some(mut known) = hash_all(&jobs, hashes, reporter)? else {
+        return Ok(None);
+    };
 
     for key in keys {
-        if reporter.cancelled() {
-            return Ok(None);
-        }
-        if needs_hash(key, local, remote, state) {
-            reporter.item(Phase::Compare, compared, key);
-            compared += 1;
-        }
-
-        // A path that is a file on one side and a directory on the other can
-        // never be reconciled by copying; refuse to touch it.
-        if local.dirs.contains(key) || remote.dirs.contains(key) {
-            plan.conflicts.push(Conflict {
-                rel_path: key.to_string(),
-                kind: ConflictKind::TypeMismatch,
-                local: local.files.get(key).map(stat_of),
-                remote: remote.files.get(key).map(stat_of),
-            });
-            continue;
-        }
-
-        let l = local.files.get(key);
-        let r = remote.files.get(key);
-        let s = state.get(key);
-
-        match (l, r, s) {
-            (Some(l), Some(r), Some(s)) => {
-                let l_suspect = local_suspect(l, s);
-                let r_suspect = remote_suspect(r, s);
-                if !l_suspect && !r_suspect {
-                    continue;
-                }
-
-                let lh = if l_suspect {
-                    hashes.hash(Side::Local, key)?
-                } else {
-                    s.hash.clone()
-                };
-                let rh = if r_suspect {
-                    hashes.hash(Side::Remote, key)?
-                } else {
-                    s.hash.clone()
-                };
-
-                match (lh != s.hash, rh != s.hash) {
-                    (false, false) => plan.actions.push(Action::RecordState {
-                        rel_path: key.to_string(),
-                        hash: s.hash.clone(),
-                        local: stat_of(l),
-                        remote: stat_of(r),
-                    }),
-                    (true, false) => plan.actions.push(Action::Copy {
-                        rel_path: key.to_string(),
-                        from: Side::Local,
-                        size: l.size,
-                        hash: lh,
-                    }),
-                    (false, true) => plan.actions.push(Action::Copy {
-                        rel_path: key.to_string(),
-                        from: Side::Remote,
-                        size: r.size,
-                        hash: rh,
-                    }),
-                    (true, true) => {
-                        if lh == rh {
-                            plan.actions.push(Action::RecordState {
-                                rel_path: key.to_string(),
-                                hash: lh,
-                                local: stat_of(l),
-                                remote: stat_of(r),
-                            });
-                        } else {
-                            plan.conflicts.push(Conflict {
-                                rel_path: key.to_string(),
-                                kind: ConflictKind::BothEdited,
-                                local: Some(stat_of(l)),
-                                remote: Some(stat_of(r)),
-                            });
-                        }
-                    }
-                }
-            }
-
-            (Some(l), Some(r), None) => {
-                let lh = hashes.hash(Side::Local, key)?;
-                let rh = hashes.hash(Side::Remote, key)?;
-                if lh == rh {
-                    plan.actions.push(Action::RecordState {
-                        rel_path: key.to_string(),
-                        hash: lh,
-                        local: stat_of(l),
-                        remote: stat_of(r),
-                    });
-                } else {
-                    plan.conflicts.push(Conflict {
-                        rel_path: key.to_string(),
-                        kind: ConflictKind::BothNew,
-                        local: Some(stat_of(l)),
-                        remote: Some(stat_of(r)),
-                    });
-                }
-            }
-
-            (Some(l), None, Some(s)) => {
-                let changed = local_suspect(l, s) && hashes.hash(Side::Local, key)? != s.hash;
-                if changed {
-                    plan.conflicts.push(Conflict {
-                        rel_path: key.to_string(),
-                        kind: ConflictKind::EditedLocalDeletedRemote,
-                        local: Some(stat_of(l)),
-                        remote: None,
-                    });
-                } else {
-                    plan.actions.push(Action::Trash {
-                        rel_path: key.to_string(),
-                        side: Side::Local,
-                    });
-                }
-            }
-
-            (None, Some(r), Some(s)) => {
-                let changed = remote_suspect(r, s) && hashes.hash(Side::Remote, key)? != s.hash;
-                if changed {
-                    plan.conflicts.push(Conflict {
-                        rel_path: key.to_string(),
-                        kind: ConflictKind::EditedRemoteDeletedLocal,
-                        local: None,
-                        remote: Some(stat_of(r)),
-                    });
-                } else {
-                    plan.actions.push(Action::Trash {
-                        rel_path: key.to_string(),
-                        side: Side::Remote,
-                    });
-                }
-            }
-
-            (Some(l), None, None) => plan.actions.push(Action::Copy {
-                rel_path: key.to_string(),
-                from: Side::Local,
-                size: l.size,
-                hash: hashes.hash(Side::Local, key)?,
-            }),
-
-            (None, Some(r), None) => plan.actions.push(Action::Copy {
-                rel_path: key.to_string(),
-                from: Side::Remote,
-                size: r.size,
-                hash: hashes.hash(Side::Remote, key)?,
-            }),
-
-            (None, None, Some(_)) => plan.actions.push(Action::DropState {
-                rel_path: key.to_string(),
-            }),
-
-            (None, None, None) => unreachable!("key came from one of the three sources"),
-        }
+        decide(key, local, remote, state, &mut known, &mut plan);
     }
-
-    reporter.finished(Phase::Compare, compared);
     Ok(Some(plan))
 }
 
-/// Whether deciding `key` will ask the `HashProvider` for at least one hash.
+/// Hash every (side, path) in `jobs` on a pool of threads.
 ///
-/// The pre-pass counts these to give `Phase::Compare` its total and the main
-/// loop emits an item for exactly these paths, so the two must agree: every
-/// arm below mirrors the corresponding arm of the decision table.
-fn needs_hash(key: &str, local: &Scan, remote: &Scan, state: &BTreeMap<String, StateRow>) -> bool {
+/// Workers only read files; the calling thread owns the `Reporter`, which is
+/// not thread-safe, and reports each path as its hashes arrive. Results arrive
+/// in completion order, so item order is not path order.
+fn hash_all<'k>(
+    jobs: &[(&'k str, Needs)],
+    hashes: &dyn HashProvider,
+    reporter: &Reporter,
+) -> Result<Option<Hashes<'k>>> {
+    reporter.started(Phase::Compare, Some(jobs.len()));
+    if reporter.cancelled() {
+        return Ok(None);
+    }
+
+    let next = AtomicUsize::new(0);
+    let stop = AtomicBool::new(false);
+    let (tx, rx) = mpsc::channel::<(usize, Result<Vec<(Side, String)>>)>();
+    let workers = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .clamp(2, MAX_HASH_THREADS)
+        .min(jobs.len());
+
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            let tx = tx.clone();
+            let (next, stop) = (&next, &stop);
+            scope.spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(&(key, needs)) = jobs.get(index) else {
+                        break;
+                    };
+                    let result = needs
+                        .sides()
+                        .map(|side| hashes.hash(side, key).map(|h| (side, h)))
+                        .collect();
+                    if tx.send((index, result)).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        // Only the workers' clones remain, so the channel closes once they
+        // have all run out of jobs.
+        drop(tx);
+
+        // Returning early sets `stop`; the scope then waits for each worker to
+        // finish the file it is on, which no longer delays anything visible.
+        let mut known = Hashes::new();
+        let mut done = 0usize;
+        loop {
+            match rx.recv_timeout(CANCEL_POLL) {
+                Ok((index, result)) => {
+                    let key = jobs[index].0;
+                    match result {
+                        Ok(pairs) => known.extend(pairs.into_iter().map(|(s, h)| ((s, key), h))),
+                        Err(e) => {
+                            stop.store(true, Ordering::Relaxed);
+                            return Err(e);
+                        }
+                    }
+                    reporter.item(Phase::Compare, done, key);
+                    done += 1;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+            if reporter.cancelled() {
+                stop.store(true, Ordering::Relaxed);
+                return Ok(None);
+            }
+        }
+        reporter.finished(Phase::Compare, done);
+        Ok(Some(known))
+    })
+}
+
+/// Which hashes deciding `key` will read.
+///
+/// `decide` treats a hash as present exactly when this says it is needed, so
+/// this function alone chooses between reading a file and settling the path
+/// from its size. A size that differs from the recorded one proves the content
+/// changed (the recorded hash was taken of a file of the recorded size); a
+/// changed mtime alone does not.
+fn needs(key: &str, local: &Scan, remote: &Scan, state: &BTreeMap<String, StateRow>) -> Needs {
     // A type mismatch is settled without reading either file.
     if local.dirs.contains(key) || remote.dirs.contains(key) {
-        return false;
+        return Needs::NONE;
     }
     match (local.files.get(key), remote.files.get(key), state.get(key)) {
-        // Suspect on either side means at least one hash; counted once.
-        (Some(l), Some(r), Some(s)) => local_suspect(l, s) || remote_suspect(r, s),
-        (Some(l), None, Some(s)) => local_suspect(l, s),
-        (None, Some(r), Some(s)) => remote_suspect(r, s),
-        // Nothing recorded, so there is nothing to compare against.
-        (Some(_), Some(_), None) | (Some(_), None, None) | (None, Some(_), None) => true,
+        (Some(l), Some(r), Some(s)) => match (local_suspect(l, s), remote_suspect(r, s)) {
+            (false, false) => Needs::NONE,
+            // A resized side has certainly changed and the other has not, so
+            // it is copied; the copy hashes it.
+            (true, false) => Needs {
+                local: !local_resized(l, s),
+                remote: false,
+            },
+            (false, true) => Needs {
+                local: false,
+                remote: !remote_resized(r, s),
+            },
+            // Both edited, to different sizes: a conflict, whatever the bytes.
+            (true, true) if local_resized(l, s) && remote_resized(r, s) && l.size != r.size => {
+                Needs::NONE
+            }
+            (true, true) => Needs::BOTH,
+        },
+        // Nothing recorded: only equal sizes can be equal content.
+        (Some(l), Some(r), None) if l.size != r.size => Needs::NONE,
+        (Some(_), Some(_), None) => Needs::BOTH,
+        (Some(l), None, Some(s)) => Needs {
+            local: local_suspect(l, s) && !local_resized(l, s),
+            remote: false,
+        },
+        (None, Some(r), Some(s)) => Needs {
+            local: false,
+            remote: remote_suspect(r, s) && !remote_resized(r, s),
+        },
+        // New on one side: copied, and hashed by the copy.
+        (Some(_), None, None) | (None, Some(_), None) => Needs::NONE,
         // Gone from both sides: the row is dropped without any I/O.
-        (None, None, _) => false,
+        (None, None, _) => Needs::NONE,
     }
 }
 
-fn local_suspect(l: &crate::scan::Entry, s: &StateRow) -> bool {
+/// Add the action or conflict for `key` to `plan`, using the hashes `needs`
+/// asked for.
+fn decide<'k>(
+    key: &'k str,
+    local: &Scan,
+    remote: &Scan,
+    state: &BTreeMap<String, StateRow>,
+    known: &mut Hashes<'k>,
+    plan: &mut Plan,
+) {
+    // A path that is a file on one side and a directory on the other can
+    // never be reconciled by copying; refuse to touch it.
+    if local.dirs.contains(key) || remote.dirs.contains(key) {
+        plan.conflicts.push(Conflict {
+            rel_path: key.to_string(),
+            kind: ConflictKind::TypeMismatch,
+            local: local.files.get(key).map(stat_of),
+            remote: remote.files.get(key).map(stat_of),
+        });
+        return;
+    }
+
+    let needs = needs(key, local, remote, state);
+    let mut take = |needed: bool, side: Side| {
+        needed.then(|| {
+            known
+                .remove(&(side, key))
+                .expect("the pre-pass hashes every side `needs` names")
+        })
+    };
+    let lh = take(needs.local, Side::Local);
+    let rh = take(needs.remote, Side::Remote);
+
+    let copy = |from: Side, e: &Entry| Action::Copy {
+        rel_path: key.to_string(),
+        from,
+        size: e.size,
+    };
+    let conflict = |kind, l: Option<&Entry>, r: Option<&Entry>| Conflict {
+        rel_path: key.to_string(),
+        kind,
+        local: l.map(stat_of),
+        remote: r.map(stat_of),
+    };
+    let record = |hash: String, l: &Entry, r: &Entry| Action::RecordState {
+        rel_path: key.to_string(),
+        hash,
+        local: stat_of(l),
+        remote: stat_of(r),
+    };
+    // A suspect side with no hash was resized, which settles it as changed.
+    let changed = |suspect: bool, hash: &Option<String>, s: &StateRow| {
+        suspect && hash.as_ref().is_none_or(|h| *h != s.hash)
+    };
+
+    match (local.files.get(key), remote.files.get(key), state.get(key)) {
+        (Some(l), Some(r), Some(s)) => {
+            let (l_suspect, r_suspect) = (local_suspect(l, s), remote_suspect(r, s));
+            match (changed(l_suspect, &lh, s), changed(r_suspect, &rh, s)) {
+                // Only metadata drifted: remember the new stats so the next
+                // scan does not hash again.
+                (false, false) if l_suspect || r_suspect => {
+                    plan.actions.push(record(s.hash.clone(), l, r))
+                }
+                (false, false) => {}
+                (true, false) => plan.actions.push(copy(Side::Local, l)),
+                (false, true) => plan.actions.push(copy(Side::Remote, r)),
+                (true, true) => match (lh, rh) {
+                    (Some(lh), Some(rh)) if lh == rh => plan.actions.push(record(lh, l, r)),
+                    _ => plan
+                        .conflicts
+                        .push(conflict(ConflictKind::BothEdited, Some(l), Some(r))),
+                },
+            }
+        }
+
+        (Some(l), Some(r), None) => match (lh, rh) {
+            (Some(lh), Some(rh)) if lh == rh => plan.actions.push(record(lh, l, r)),
+            _ => plan
+                .conflicts
+                .push(conflict(ConflictKind::BothNew, Some(l), Some(r))),
+        },
+
+        (Some(l), None, Some(s)) => {
+            if changed(local_suspect(l, s), &lh, s) {
+                plan.conflicts.push(conflict(
+                    ConflictKind::EditedLocalDeletedRemote,
+                    Some(l),
+                    None,
+                ));
+            } else {
+                plan.actions.push(Action::Trash {
+                    rel_path: key.to_string(),
+                    side: Side::Local,
+                });
+            }
+        }
+
+        (None, Some(r), Some(s)) => {
+            if changed(remote_suspect(r, s), &rh, s) {
+                plan.conflicts.push(conflict(
+                    ConflictKind::EditedRemoteDeletedLocal,
+                    None,
+                    Some(r),
+                ));
+            } else {
+                plan.actions.push(Action::Trash {
+                    rel_path: key.to_string(),
+                    side: Side::Remote,
+                });
+            }
+        }
+
+        (Some(l), None, None) => plan.actions.push(copy(Side::Local, l)),
+
+        (None, Some(r), None) => plan.actions.push(copy(Side::Remote, r)),
+
+        (None, None, Some(_)) => plan.actions.push(Action::DropState {
+            rel_path: key.to_string(),
+        }),
+
+        (None, None, None) => unreachable!("key came from one of the three sources"),
+    }
+}
+
+fn local_suspect(l: &Entry, s: &StateRow) -> bool {
     l.size != s.local_size || l.mtime != s.local_mtime
 }
 
-fn remote_suspect(r: &crate::scan::Entry, s: &StateRow) -> bool {
+fn remote_suspect(r: &Entry, s: &StateRow) -> bool {
     r.size != s.remote_size || r.mtime != s.remote_mtime
+}
+
+fn local_resized(l: &Entry, s: &StateRow) -> bool {
+    l.size != s.local_size
+}
+
+fn remote_resized(r: &Entry, s: &StateRow) -> bool {
+    r.size != s.remote_size
 }
 
 /// Hashes files on the real filesystem.
@@ -263,7 +388,7 @@ impl HashProvider for FsHashProvider {
     }
 }
 
-fn stat_of(e: &crate::scan::Entry) -> Stat {
+fn stat_of(e: &Entry) -> Stat {
     Stat {
         size: e.size,
         mtime: e.mtime,
@@ -379,14 +504,17 @@ mod tests {
         })?
     }
 
+    /// Sorted, since paths are reported in the order their hashes finish.
     fn compared_paths(events: &[crate::progress::Progress]) -> Vec<String> {
-        events
+        let mut paths: Vec<String> = events
             .iter()
             .filter_map(|e| match e {
                 crate::progress::Progress::Item { rel_path, .. } => Some(rel_path.clone()),
                 _ => None,
             })
-            .collect()
+            .collect();
+        paths.sort();
+        paths
     }
 
     #[test]
@@ -401,7 +529,8 @@ mod tests {
 
     #[test]
     fn local_edit_copies_to_remote() {
-        let local = scan_of(&[("a.txt", 12, 150)]);
+        // Same size, so only the hash can tell the edit apart from drift.
+        let local = scan_of(&[("a.txt", 10, 150)]);
         let remote = scan_of(&[("a.txt", 10, 200)]);
         let state = state_of(&[("a.txt", "h1", 10, 100, 10, 200)]);
         let h = hashes(&[(Side::Local, "a.txt", "h2")]);
@@ -411,8 +540,7 @@ mod tests {
             vec![Action::Copy {
                 rel_path: "a.txt".into(),
                 from: Side::Local,
-                size: 12,
-                hash: "h2".into(),
+                size: 10,
             }]
         );
     }
@@ -420,7 +548,7 @@ mod tests {
     #[test]
     fn remote_edit_copies_to_local() {
         let local = scan_of(&[("a.txt", 10, 100)]);
-        let remote = scan_of(&[("a.txt", 14, 250)]);
+        let remote = scan_of(&[("a.txt", 10, 250)]);
         let state = state_of(&[("a.txt", "h1", 10, 100, 10, 200)]);
         let h = hashes(&[(Side::Remote, "a.txt", "h3")]);
         let plan = plan_of(&local, &remote, &state, &h);
@@ -429,10 +557,54 @@ mod tests {
             vec![Action::Copy {
                 rel_path: "a.txt".into(),
                 from: Side::Remote,
-                size: 14,
-                hash: "h3".into(),
+                size: 10,
             }]
         );
+    }
+
+    #[test]
+    fn a_resized_local_file_is_copied_without_hashing() {
+        let local = scan_of(&[("a.txt", 12, 150)]);
+        let remote = scan_of(&[("a.txt", 10, 200)]);
+        let state = state_of(&[("a.txt", "h1", 10, 100, 10, 200)]);
+        let plan = plan_of(&local, &remote, &state, &no_hashes());
+        assert_eq!(
+            plan.actions,
+            vec![Action::Copy {
+                rel_path: "a.txt".into(),
+                from: Side::Local,
+                size: 12,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_resized_remote_file_is_copied_without_hashing() {
+        let local = scan_of(&[("a.txt", 10, 100)]);
+        let remote = scan_of(&[("a.txt", 14, 250)]);
+        let state = state_of(&[("a.txt", "h1", 10, 100, 10, 200)]);
+        let plan = plan_of(&local, &remote, &state, &no_hashes());
+        assert_eq!(
+            plan.actions,
+            vec![Action::Copy {
+                rel_path: "a.txt".into(),
+                from: Side::Remote,
+                size: 14,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_touched_but_unchanged_file_beside_a_resized_peer_still_copies() {
+        // Both suspect, one resized: both are hashed, and the untouched content
+        // on the remote side makes this a plain local edit.
+        let local = scan_of(&[("a.txt", 12, 150)]);
+        let remote = scan_of(&[("a.txt", 10, 999)]);
+        let state = state_of(&[("a.txt", "h1", 10, 100, 10, 200)]);
+        let h = hashes(&[(Side::Local, "a.txt", "h2"), (Side::Remote, "a.txt", "h1")]);
+        let plan = plan_of(&local, &remote, &state, &h);
+        assert_eq!(plan.copy_count(Side::Remote), 1, "got: {:?}", plan.actions);
+        assert!(plan.conflicts.is_empty());
     }
 
     #[test]
@@ -486,12 +658,22 @@ mod tests {
     }
 
     #[test]
-    fn both_edited_differently_is_a_conflict() {
+    fn both_edited_to_the_same_size_but_different_content_is_a_conflict() {
         let local = scan_of(&[("a.txt", 20, 900)]);
-        let remote = scan_of(&[("a.txt", 30, 901)]);
+        let remote = scan_of(&[("a.txt", 20, 901)]);
         let state = state_of(&[("a.txt", "h1", 10, 100, 10, 200)]);
         let h = hashes(&[(Side::Local, "a.txt", "hL"), (Side::Remote, "a.txt", "hR")]);
         let plan = plan_of(&local, &remote, &state, &h);
+        assert!(plan.actions.is_empty());
+        assert_eq!(plan.conflicts[0].kind, ConflictKind::BothEdited);
+    }
+
+    #[test]
+    fn both_edited_to_different_sizes_is_a_conflict_without_hashing() {
+        let local = scan_of(&[("a.txt", 20, 900)]);
+        let remote = scan_of(&[("a.txt", 30, 901)]);
+        let state = state_of(&[("a.txt", "h1", 10, 100, 10, 200)]);
+        let plan = plan_of(&local, &remote, &state, &no_hashes());
         assert!(plan.actions.is_empty());
         assert_eq!(
             plan.conflicts,
@@ -536,9 +718,17 @@ mod tests {
     #[test]
     fn new_on_both_sides_with_different_content_is_a_conflict() {
         let local = scan_of(&[("a.txt", 10, 100)]);
-        let remote = scan_of(&[("a.txt", 11, 200)]);
+        let remote = scan_of(&[("a.txt", 10, 200)]);
         let h = hashes(&[(Side::Local, "a.txt", "hL"), (Side::Remote, "a.txt", "hR")]);
         let plan = plan_of(&local, &remote, &BTreeMap::new(), &h);
+        assert_eq!(plan.conflicts[0].kind, ConflictKind::BothNew);
+    }
+
+    #[test]
+    fn new_on_both_sides_with_different_sizes_is_a_conflict_without_hashing() {
+        let local = scan_of(&[("a.txt", 10, 100)]);
+        let remote = scan_of(&[("a.txt", 11, 200)]);
+        let plan = plan_of(&local, &remote, &BTreeMap::new(), &no_hashes());
         assert_eq!(plan.conflicts[0].kind, ConflictKind::BothNew);
     }
 
@@ -557,10 +747,8 @@ mod tests {
             },
         );
         // The child `thing/inner.txt` is a genuine new-remote file (local has no
-        // such path), so the completed decision table schedules it for copy and
-        // asks for its hash.
-        let h = hashes(&[(Side::Remote, "thing/inner.txt", "hInner")]);
-        let plan = plan_of(&local, &remote, &BTreeMap::new(), &h);
+        // such path), so the completed decision table schedules it for copy.
+        let plan = plan_of(&local, &remote, &BTreeMap::new(), &no_hashes());
         assert!(
             plan.conflicts
                 .iter()
@@ -629,11 +817,22 @@ mod tests {
     }
 
     #[test]
-    fn remote_deleted_but_local_edited_is_a_conflict() {
-        let local = scan_of(&[("a.txt", 99, 900)]);
+    fn remote_deleted_but_local_edited_in_place_is_a_conflict() {
+        let local = scan_of(&[("a.txt", 10, 900)]);
         let state = state_of(&[("a.txt", "h1", 10, 100, 10, 200)]);
         let h = hashes(&[(Side::Local, "a.txt", "hNEW")]);
         let plan = plan_of(&local, &Scan::default(), &state, &h);
+        assert_eq!(
+            plan.conflicts[0].kind,
+            ConflictKind::EditedLocalDeletedRemote
+        );
+    }
+
+    #[test]
+    fn remote_deleted_but_local_resized_is_a_conflict_without_hashing() {
+        let local = scan_of(&[("a.txt", 99, 900)]);
+        let state = state_of(&[("a.txt", "h1", 10, 100, 10, 200)]);
+        let plan = plan_of(&local, &Scan::default(), &state, &no_hashes());
         assert!(plan.actions.is_empty(), "got: {:?}", plan.actions);
         assert_eq!(
             plan.conflicts,
@@ -651,7 +850,7 @@ mod tests {
 
     #[test]
     fn local_deleted_but_remote_edited_is_a_conflict() {
-        let remote = scan_of(&[("a.txt", 99, 900)]);
+        let remote = scan_of(&[("a.txt", 10, 900)]);
         let state = state_of(&[("a.txt", "h1", 10, 100, 10, 200)]);
         let h = hashes(&[(Side::Remote, "a.txt", "hNEW")]);
         let plan = plan_of(&Scan::default(), &remote, &state, &h);
@@ -680,33 +879,29 @@ mod tests {
     }
 
     #[test]
-    fn a_new_local_file_copies_to_remote() {
+    fn a_new_local_file_copies_to_remote_without_hashing() {
         let local = scan_of(&[("new.txt", 42, 100)]);
-        let h = hashes(&[(Side::Local, "new.txt", "hN")]);
-        let plan = plan_of(&local, &Scan::default(), &BTreeMap::new(), &h);
+        let plan = plan_of(&local, &Scan::default(), &BTreeMap::new(), &no_hashes());
         assert_eq!(
             plan.actions,
             vec![Action::Copy {
                 rel_path: "new.txt".into(),
                 from: Side::Local,
                 size: 42,
-                hash: "hN".into(),
             }]
         );
     }
 
     #[test]
-    fn a_new_remote_file_copies_to_local() {
+    fn a_new_remote_file_copies_to_local_without_hashing() {
         let remote = scan_of(&[("new.txt", 42, 100)]);
-        let h = hashes(&[(Side::Remote, "new.txt", "hN")]);
-        let plan = plan_of(&Scan::default(), &remote, &BTreeMap::new(), &h);
+        let plan = plan_of(&Scan::default(), &remote, &BTreeMap::new(), &no_hashes());
         assert_eq!(
             plan.actions,
             vec![Action::Copy {
                 rel_path: "new.txt".into(),
                 from: Side::Remote,
                 size: 42,
-                hash: "hN".into(),
             }]
         );
     }
@@ -757,12 +952,7 @@ mod tests {
             ("delremote.txt", "h3", 10, 100, 10, 200),
             ("dellocal.txt", "h4", 10, 100, 10, 200),
         ]);
-        let h = hashes(&[
-            (Side::Local, "edited.txt", "hE"),
-            (Side::Local, "newlocal.txt", "hNL"),
-            (Side::Remote, "newremote.txt", "hNR"),
-        ]);
-        let plan = plan_of(&local, &remote, &state, &h);
+        let plan = plan_of(&local, &remote, &state, &no_hashes());
 
         assert_eq!(
             plan.copy_count(Side::Remote),
@@ -777,19 +967,22 @@ mod tests {
     #[test]
     fn the_compare_total_counts_exactly_the_suspect_paths() {
         let local = scan_of(&[
-            ("same.txt", 10, 100),   // unchanged on both sides
-            ("edited.txt", 20, 900), // locally modified
-            ("theirs.txt", 10, 100), // remotely modified
+            ("same.txt", 10, 100),    // unchanged on both sides
+            ("edited.txt", 10, 900),  // touched locally
+            ("theirs.txt", 10, 100),  // touched remotely
+            ("resized.txt", 20, 900), // resized locally, so no hash is needed
         ]);
         let remote = scan_of(&[
             ("same.txt", 10, 200),
             ("edited.txt", 10, 200),
-            ("theirs.txt", 30, 800),
+            ("theirs.txt", 10, 800),
+            ("resized.txt", 10, 200),
         ]);
         let state = state_of(&[
             ("same.txt", "h1", 10, 100, 10, 200),
             ("edited.txt", "h2", 10, 100, 10, 200),
             ("theirs.txt", "h3", 10, 100, 10, 200),
+            ("resized.txt", "h4", 10, 100, 10, 200),
         ]);
         let h = hashes(&[
             (Side::Local, "edited.txt", "hE"),
@@ -797,7 +990,11 @@ mod tests {
         ]);
         let events = events_of(&local, &remote, &state, &h);
 
-        assert_eq!(compare_total(&events), Some(2), "same.txt needs no hash");
+        assert_eq!(
+            compare_total(&events),
+            Some(2),
+            "same.txt and resized.txt need no hash"
+        );
         assert_eq!(
             compared_paths(&events),
             vec!["edited.txt".to_string(), "theirs.txt".to_string()]
@@ -806,8 +1003,8 @@ mod tests {
 
     #[test]
     fn a_path_suspect_on_both_sides_is_counted_once() {
-        let local = scan_of(&[("a.txt", 20, 900)]);
-        let remote = scan_of(&[("a.txt", 30, 901)]);
+        let local = scan_of(&[("a.txt", 10, 900)]);
+        let remote = scan_of(&[("a.txt", 10, 901)]);
         let state = state_of(&[("a.txt", "h1", 10, 100, 10, 200)]);
         let h = hashes(&[(Side::Local, "a.txt", "hL"), (Side::Remote, "a.txt", "hR")]);
         let events = events_of(&local, &remote, &state, &h);
@@ -839,11 +1036,12 @@ mod tests {
 
     #[test]
     fn the_finished_count_matches_the_total() {
-        let local = scan_of(&[("new.txt", 42, 100), ("edited.txt", 20, 900)]);
-        let remote = scan_of(&[("edited.txt", 10, 200)]);
+        let local = scan_of(&[("both.txt", 5, 100), ("edited.txt", 10, 900)]);
+        let remote = scan_of(&[("both.txt", 5, 100), ("edited.txt", 10, 200)]);
         let state = state_of(&[("edited.txt", "h2", 10, 100, 10, 200)]);
         let h = hashes(&[
-            (Side::Local, "new.txt", "hN"),
+            (Side::Local, "both.txt", "hB"),
+            (Side::Remote, "both.txt", "hB"),
             (Side::Local, "edited.txt", "hE"),
         ]);
         let events = events_of(&local, &remote, &state, &h);
@@ -878,6 +1076,86 @@ mod tests {
             &BTreeMap::new(),
             &no_hashes(),
             &Reporter::new(&sink, &|| true),
+        )
+        .unwrap();
+        assert!(plan.is_none());
+    }
+
+    #[test]
+    fn many_paths_hash_in_parallel_into_the_same_plan() {
+        // Enough work for every worker; each path's hashes must land on that
+        // path and no other.
+        let n = 200;
+        let names: Vec<String> = (0..n).map(|i| format!("f{i:03}.txt")).collect();
+        let items: Vec<_> = names.iter().map(|p| (p.as_str(), 10, 100)).collect();
+        let local = scan_of(&items);
+        let remote = scan_of(&items);
+        // Every third path differs, so a crossed wire changes the plan.
+        let table = || {
+            let mut table = BTreeMap::new();
+            for (i, p) in names.iter().enumerate() {
+                let r = if i % 3 == 0 {
+                    format!("x{i}")
+                } else {
+                    format!("h{i}")
+                };
+                table.insert((Side::Local, p.clone()), format!("h{i}"));
+                table.insert((Side::Remote, p.clone()), r);
+            }
+            MapHashProvider(table)
+        };
+        let events = events_of(&local, &remote, &BTreeMap::new(), &table());
+        assert_eq!(compare_total(&events), Some(n));
+        assert_eq!(compared_paths(&events), names);
+
+        let indices: Vec<usize> = events
+            .iter()
+            .filter_map(|e| match e {
+                crate::progress::Progress::Item { index, .. } => Some(*index),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(indices, (0..n).collect::<Vec<_>>(), "indices count up");
+
+        let plan = plan_of(&local, &remote, &BTreeMap::new(), &table());
+        let conflicted: Vec<_> = plan.conflicts.iter().map(|c| c.rel_path.clone()).collect();
+        let expected: Vec<_> = names.iter().step_by(3).cloned().collect();
+        assert_eq!(conflicted, expected);
+        assert_eq!(plan.actions.len(), n - expected.len());
+    }
+
+    #[test]
+    fn a_hash_failure_fails_the_comparison() {
+        let local = scan_of(&[("a.txt", 10, 100), ("b.txt", 10, 100)]);
+        let remote = scan_of(&[("a.txt", 10, 200), ("b.txt", 10, 200)]);
+        // b.txt has no hashes, so the provider errors on it.
+        let h = hashes(&[(Side::Local, "a.txt", "h"), (Side::Remote, "a.txt", "h")]);
+        let result = reconcile(&local, &remote, &BTreeMap::new(), &h, &Reporter::silent());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn cancelling_mid_hash_yields_no_plan() {
+        let names: Vec<String> = (0..50).map(|i| format!("f{i}.txt")).collect();
+        let items: Vec<_> = names.iter().map(|p| (p.as_str(), 10, 100)).collect();
+        let local = scan_of(&items);
+        let remote = scan_of(&items);
+        let mut table = BTreeMap::new();
+        for p in &names {
+            table.insert((Side::Local, p.clone()), "h".to_string());
+            table.insert((Side::Remote, p.clone()), "h".to_string());
+        }
+        let checks = std::cell::Cell::new(0usize);
+        let sink = |_| {};
+        let plan = reconcile(
+            &local,
+            &remote,
+            &BTreeMap::new(),
+            &MapHashProvider(table),
+            &Reporter::new(&sink, &|| {
+                checks.set(checks.get() + 1);
+                checks.get() > 3
+            }),
         )
         .unwrap();
         assert!(plan.is_none());

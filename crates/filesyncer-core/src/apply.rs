@@ -7,31 +7,47 @@ use std::path::{Path, PathBuf};
 
 pub const TEMP_SUFFIX: &str = ".filesyncer-tmp";
 
+/// Read size for copies. Large enough that a network share is asked for few,
+/// big reads, and that BLAKE3 can hash many chunks per call.
+const COPY_BUF: usize = 256 * 1024;
+
+/// Committing state every action is the safest shape but costs a write per
+/// file; batching bounds what a crash can lose to this many rows, all of which
+/// the next scan rebuilds by hashing (see `apply`).
+const COMMIT_EVERY: usize = 500;
+
 fn temp_path_for(dst: &Path) -> PathBuf {
     let name = dst.file_name().unwrap_or_default().to_string_lossy();
     dst.with_file_name(format!("{name}{TEMP_SUFFIX}-{}", std::process::id()))
 }
 
 /// Copy `src` over `dst` such that `dst` is never observed partially written.
-pub fn copy_atomic(src: &Path, dst: &Path) -> Result<()> {
+///
+/// Returns the BLAKE3 hash of the bytes copied, computed in the same pass so
+/// the source is read once.
+pub fn copy_atomic(src: &Path, dst: &Path) -> Result<String> {
     if let Some(parent) = dst.parent() {
         std::fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
     }
     let tmp = temp_path_for(dst);
 
     // Scoped so both handles are closed before the rename.
-    {
+    let hash = {
         let mut reader = std::fs::File::open(src).map_err(|e| Error::io(src, e))?;
         let mut writer = std::fs::File::create(&tmp).map_err(|e| Error::io(&tmp, e))?;
-        if let Err(e) = std::io::copy(&mut reader, &mut writer) {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(Error::io(&tmp, e));
-        }
+        let hash = match copy_hashing(&mut reader, &mut writer) {
+            Ok(hash) => hash,
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e.into_error(src, &tmp));
+            }
+        };
         if let Err(e) = writer.sync_all() {
             let _ = std::fs::remove_file(&tmp);
             return Err(Error::io(&tmp, e));
         }
-    }
+        hash
+    };
 
     std::fs::rename(&tmp, dst).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
@@ -40,7 +56,42 @@ pub fn copy_atomic(src: &Path, dst: &Path) -> Result<()> {
 
     let meta = std::fs::metadata(src).map_err(|e| Error::io(src, e))?;
     let mtime = filetime::FileTime::from_last_modification_time(&meta);
-    filetime::set_file_mtime(dst, mtime).map_err(|e| Error::io(dst, e))
+    filetime::set_file_mtime(dst, mtime).map_err(|e| Error::io(dst, e))?;
+    Ok(hash)
+}
+
+/// Which end of a copy failed, so the error names the right path.
+enum CopyError {
+    Read(std::io::Error),
+    Write(std::io::Error),
+}
+
+impl CopyError {
+    fn into_error(self, src: &Path, dst: &Path) -> Error {
+        match self {
+            CopyError::Read(e) => Error::io(src, e),
+            CopyError::Write(e) => Error::io(dst, e),
+        }
+    }
+}
+
+fn copy_hashing(
+    reader: &mut impl std::io::Read,
+    writer: &mut impl std::io::Write,
+) -> std::result::Result<String, CopyError> {
+    let mut buf = vec![0u8; COPY_BUF];
+    let mut hasher = blake3::Hasher::new();
+    loop {
+        let n = match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(CopyError::Read(e)),
+        };
+        hasher.update(&buf[..n]);
+        writer.write_all(&buf[..n]).map_err(CopyError::Write)?;
+    }
+    Ok(crate::hash::to_hex(hasher))
 }
 
 /// Move `root/rel_path` into `root/.filesyncer-trash/<run_stamp>/<rel_path>`.
@@ -149,8 +200,26 @@ pub fn apply(plan: &Plan, ctx: &ApplyCtx, reporter: &Reporter) -> Result<RunSumm
     reporter.started(Phase::Apply, Some(total));
 
     let mut done = 0usize;
+    let mut last_commit = std::time::Instant::now();
+
+    // State rows are written in batches, not one transaction per action. A
+    // crash can therefore lose the rows of up to `COMMIT_EVERY` finished
+    // actions, but never in a way that loses data: a copied file without a row
+    // is new on both sides with equal content, so the next scan hashes both and
+    // adopts it; a trashed file without its row removed is gone from both
+    // sides and the row is dropped. A clean finish or a cancel commits all.
+    ctx.state.begin()?;
 
     for (index, action) in plan.actions.iter().enumerate() {
+        if index > 0
+            && (index.is_multiple_of(COMMIT_EVERY)
+                || last_commit.elapsed() > std::time::Duration::from_secs(2))
+        {
+            ctx.state.commit()?;
+            ctx.state.begin()?;
+            last_commit = std::time::Instant::now();
+        }
+
         if reporter.cancelled() {
             summary.cancelled = true;
             break;
@@ -166,15 +235,10 @@ pub fn apply(plan: &Plan, ctx: &ApplyCtx, reporter: &Reporter) -> Result<RunSumm
         reporter.item(Phase::Apply, index, &rel_path);
         done = index + 1;
 
-        // Each action commits its own state row, so an interruption leaves a
-        // database describing exactly the work that completed.
         let outcome = match action {
-            Action::Copy {
-                rel_path,
-                from,
-                hash,
-                ..
-            } => apply_copy(ctx, rel_path, *from, hash).map(|()| Outcome::Copied),
+            Action::Copy { rel_path, from, .. } => {
+                apply_copy(ctx, rel_path, *from).map(|()| Outcome::Copied)
+            }
             Action::Trash { rel_path, side } => {
                 move_to_trash(ctx.root(*side), rel_path, &ctx.run_stamp)
                     .and_then(|()| ctx.state.remove(rel_path))
@@ -209,21 +273,15 @@ pub fn apply(plan: &Plan, ctx: &ApplyCtx, reporter: &Reporter) -> Result<RunSumm
         }
     }
 
+    ctx.state.commit()?;
     reporter.finished(Phase::Apply, done);
     Ok(summary)
 }
 
-fn apply_copy(ctx: &ApplyCtx, rel_path: &str, from: Side, hash: &str) -> Result<()> {
+fn apply_copy(ctx: &ApplyCtx, rel_path: &str, from: Side) -> Result<()> {
     let src = ctx.root(from).join(rel_path);
     let dst = ctx.root(from.other()).join(rel_path);
-    copy_atomic(&src, &dst)?;
-
-    // A conflict resolved in the GUI carries no precomputed hash.
-    let hash = if hash.is_empty() {
-        crate::hash::hash_file(&src)?
-    } else {
-        hash.to_string()
-    };
+    let hash = copy_atomic(&src, &dst)?;
 
     let src_stat = stat_of_file(&src)?;
     let dst_stat = stat_of_file(&dst)?;
@@ -287,6 +345,18 @@ mod tests {
         std::fs::write(&src, "payload").unwrap();
         copy_atomic(&src, &dst).unwrap();
         assert_eq!(std::fs::read_to_string(&dst).unwrap(), "payload");
+    }
+
+    #[test]
+    fn copy_returns_the_hash_of_what_it_copied() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.bin");
+        // Spans several buffers, with a ragged tail.
+        let payload: Vec<u8> = (0..COPY_BUF * 3 + 17).map(|i| (i * 31) as u8).collect();
+        std::fs::write(&src, &payload).unwrap();
+        let hash = copy_atomic(&src, &dir.path().join("dst.bin")).unwrap();
+        assert_eq!(hash, crate::hash::hash_file(&src).unwrap());
+        assert_eq!(std::fs::read(dir.path().join("dst.bin")).unwrap(), payload);
     }
 
     #[test]
@@ -452,7 +522,6 @@ mod tests {
                 rel_path: "a.txt".into(),
                 from: Side::Local,
                 size: 7,
-                hash: "precomputed".into(),
             }],
             ..Default::default()
         };
@@ -464,7 +533,10 @@ mod tests {
             "payload"
         );
         let row = &f.state.load_all().unwrap()["a.txt"];
-        assert_eq!(row.hash, "precomputed");
+        assert_eq!(
+            row.hash,
+            crate::hash::hash_file(&f.local.join("a.txt")).unwrap()
+        );
         assert_eq!(row.local_size, 7);
         assert_eq!(row.remote_size, 7);
     }
@@ -478,7 +550,6 @@ mod tests {
                 rel_path: "a.txt".into(),
                 from: Side::Remote,
                 size: 11,
-                hash: "h".into(),
             }],
             ..Default::default()
         };
@@ -498,7 +569,6 @@ mod tests {
                 rel_path: "deep/nested/a.txt".into(),
                 from: Side::Local,
                 size: 1,
-                hash: "h".into(),
             }],
             ..Default::default()
         };
@@ -507,7 +577,7 @@ mod tests {
     }
 
     #[test]
-    fn a_resolved_conflict_with_no_precomputed_hash_gets_hashed_at_copy_time() {
+    fn the_recorded_hash_is_of_the_bytes_copied() {
         let f = fixture();
         f.write_local("a.txt", "payload");
         let plan = Plan {
@@ -515,7 +585,6 @@ mod tests {
                 rel_path: "a.txt".into(),
                 from: Side::Local,
                 size: 7,
-                hash: String::new(),
             }],
             ..Default::default()
         };
@@ -620,13 +689,11 @@ mod tests {
                     rel_path: "missing.txt".into(),
                     from: Side::Local,
                     size: 1,
-                    hash: "h".into(),
                 },
                 Action::Copy {
                     rel_path: "good.txt".into(),
                     from: Side::Local,
                     size: 2,
-                    hash: "h".into(),
                 },
             ],
             ..Default::default()
@@ -647,7 +714,6 @@ mod tests {
                 rel_path: "missing.txt".into(),
                 from: Side::Local,
                 size: 1,
-                hash: "h".into(),
             }],
             ..Default::default()
         };
@@ -666,13 +732,11 @@ mod tests {
                     rel_path: "a.txt".into(),
                     from: Side::Local,
                     size: 3,
-                    hash: "h".into(),
                 },
                 Action::Copy {
                     rel_path: "b.txt".into(),
                     from: Side::Local,
                     size: 3,
-                    hash: "h".into(),
                 },
             ],
             ..Default::default()
@@ -709,7 +773,6 @@ mod tests {
                 rel_path: "a.txt".into(),
                 from: Side::Local,
                 size: 3,
-                hash: "h".into(),
             }],
             ..Default::default()
         };

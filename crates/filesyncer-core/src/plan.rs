@@ -1,4 +1,4 @@
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Side {
     Local,
     Remote,
@@ -12,11 +12,12 @@ pub struct Stat {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
+    /// Carries no hash: `apply` hashes the bytes as it copies them, which
+    /// both saves a second read and records what was actually transferred.
     Copy {
         rel_path: String,
         from: Side,
         size: u64,
-        hash: String,
     },
     Trash {
         rel_path: String,
@@ -152,8 +153,6 @@ impl Plan {
                 rel_path: conflict.rel_path,
                 from: keep,
                 size: stat.size,
-                // Not precomputed: `apply` hashes the source as it copies.
-                hash: String::new(),
             }),
             None => self.actions.push(Action::Trash {
                 rel_path: conflict.rel_path,
@@ -173,7 +172,6 @@ mod tests {
             rel_path: rel.into(),
             from,
             size,
-            hash: "h".into(),
         }
     }
 
@@ -370,7 +368,6 @@ mod tests {
                 rel_path: "a.txt".into(),
                 from: Side::Local,
                 size: 20,
-                hash: String::new(),
             }]
         );
     }
