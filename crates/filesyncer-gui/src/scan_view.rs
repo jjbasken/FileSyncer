@@ -2,7 +2,7 @@ use crate::plan_view;
 use crate::profile_page;
 use crate::window::AppWindow;
 use adw::prelude::*;
-use filesyncer_core::{Phase, Plan, Progress, Reporter, Session};
+use filesyncer_core::{Compare, Phase, Plan, Progress, Reporter, Session};
 use gtk::glib;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -20,7 +20,7 @@ enum Message {
     Done(Result<Option<Plan>, String>),
 }
 
-pub fn show(aw: &Rc<AppWindow>, session: Rc<Session>) {
+pub fn show(aw: &Rc<AppWindow>, session: Rc<Session>, compare: Compare) {
     let profile = session.profile().clone();
 
     let heading = gtk::Label::builder()
@@ -97,6 +97,7 @@ pub fn show(aw: &Rc<AppWindow>, session: Rc<Session>) {
                 worker
                     .prepare(
                         false,
+                        compare,
                         &Reporter::new(&forward, &|| cancelled.load(Ordering::Relaxed)),
                     )
                     .map_err(|e| e.to_string())

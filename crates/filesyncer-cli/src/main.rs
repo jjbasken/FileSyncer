@@ -3,7 +3,9 @@ mod render;
 
 use args::{Cli, Command};
 use clap::Parser;
-use filesyncer_core::{Profile, ProfileSet, Reporter, Session, create_profile_roots, profile};
+use filesyncer_core::{
+    Compare, Profile, ProfileSet, Reporter, Session, create_profile_roots, profile,
+};
 use std::io::IsTerminal;
 
 const EXIT_OK: i32 = 0;
@@ -36,7 +38,15 @@ fn run(cli: Cli) -> Result<i32, String> {
             yes,
             dry_run,
             force,
-        } => cmd_sync(&profile, yes, dry_run, force),
+            verify,
+        } => {
+            let compare = if verify {
+                Compare::Verify
+            } else {
+                Compare::Quick
+            };
+            cmd_sync(&profile, yes, dry_run, force, compare)
+        }
     }
 }
 
@@ -124,7 +134,13 @@ fn cmd_status(id: &str) -> Result<i32, String> {
     Ok(EXIT_OK)
 }
 
-fn cmd_sync(id: &str, yes: bool, dry_run: bool, force: bool) -> Result<i32, String> {
+fn cmd_sync(
+    id: &str,
+    yes: bool,
+    dry_run: bool,
+    force: bool,
+    compare: Compare,
+) -> Result<i32, String> {
     let profile = load_profile(id)?;
     let session = Session::open(&profile).map_err(|e| e.to_string())?;
 
@@ -136,7 +152,7 @@ fn cmd_sync(id: &str, yes: bool, dry_run: bool, force: bool) -> Result<i32, Stri
     // because a scan writes nothing.
     let sink = |p| scan.borrow_mut().handle(p);
     let plan = session
-        .prepare(force, &Reporter::new(&sink, &|| false))
+        .prepare(force, compare, &Reporter::new(&sink, &|| false))
         .map_err(|e| e.to_string())?
         .expect("the CLI never cancels a scan");
 

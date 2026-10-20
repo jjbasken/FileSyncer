@@ -23,6 +23,10 @@ pub enum Command {
         /// Proceed even if the deletion threshold is exceeded.
         #[arg(long)]
         force: bool,
+        /// Read both copies of a file that is new on both sides, rather than
+        /// trusting a matching size and modification time.
+        #[arg(long)]
+        verify: bool,
     },
     /// List configured profiles.
     List,

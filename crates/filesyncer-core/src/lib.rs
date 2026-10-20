@@ -18,7 +18,7 @@ pub use plan::{
 };
 pub use profile::{Profile, ProfileSet};
 pub use progress::{Phase, Progress, Reporter};
-pub use reconcile::{FsHashProvider, HashProvider, reconcile};
+pub use reconcile::{Compare, FsHashProvider, HashProvider, reconcile};
 pub use scan::{Entry, EntryKind, Scan};
 pub use session::{Session, create_profile_roots};
 pub use state::{StateRow, StateStore};

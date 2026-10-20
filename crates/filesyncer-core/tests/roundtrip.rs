@@ -47,7 +47,7 @@ impl World {
 /// Prepare with no progress reporting.
 fn prepared(session: &Session, force: bool) -> filesyncer_core::Plan {
     session
-        .prepare(force, &Reporter::silent())
+        .prepare(force, filesyncer_core::Compare::Quick, &Reporter::silent())
         .unwrap()
         .expect("a silent reporter never cancels")
 }
