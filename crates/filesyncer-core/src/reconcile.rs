@@ -33,7 +33,7 @@ impl HashProvider for MapHashProvider {
 }
 
 /// Which sides of a path must be hashed before it can be decided.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Needs {
     local: bool,
     remote: bool,
@@ -44,11 +44,6 @@ impl Needs {
         local: false,
         remote: false,
     };
-    const BOTH: Needs = Needs {
-        local: true,
-        remote: true,
-    };
-
     fn any(self) -> bool {
         self.local || self.remote
     }
@@ -184,9 +179,9 @@ fn hash_all<'k>(
 
 /// Which hashes deciding `key` will read.
 ///
-/// `decide` treats a hash as present exactly when this says it is needed, so
-/// this function alone chooses between reading a file and settling the path
-/// from its size. A size that differs from the recorded one proves the content
+/// This function alone chooses between reading a file and settling the path
+/// from its size: `hash_all` reads exactly what it names, and `decide` reads
+/// a missing hash as "resized, so changed". A size that differs from the recorded one proves the content
 /// changed (the recorded hash was taken of a file of the recorded size); a
 /// changed mtime alone does not.
 fn needs(key: &str, local: &Scan, remote: &Scan, state: &BTreeMap<String, StateRow>) -> Needs {
@@ -207,15 +202,19 @@ fn needs(key: &str, local: &Scan, remote: &Scan, state: &BTreeMap<String, StateR
                 local: false,
                 remote: !remote_resized(r, s),
             },
-            // Both edited, to different sizes: a conflict, whatever the bytes.
-            (true, true) if local_resized(l, s) && remote_resized(r, s) && l.size != r.size => {
-                Needs::NONE
-            }
-            (true, true) => Needs::BOTH,
+            // Both touched. A resized side has changed, and its hash only
+            // matters if the other side changed too and might hold the same
+            // bytes, which takes equal sizes.
+            (true, true) => Needs {
+                local: !local_resized(l, s) || l.size == r.size,
+                remote: !remote_resized(r, s) || l.size == r.size,
+            },
         },
         // Nothing recorded: only equal sizes can be equal content.
-        (Some(l), Some(r), None) if l.size != r.size => Needs::NONE,
-        (Some(_), Some(_), None) => Needs::BOTH,
+        (Some(l), Some(r), None) => Needs {
+            local: l.size == r.size,
+            remote: l.size == r.size,
+        },
         (Some(l), None, Some(s)) => Needs {
             local: local_suspect(l, s) && !local_resized(l, s),
             remote: false,
@@ -232,7 +231,7 @@ fn needs(key: &str, local: &Scan, remote: &Scan, state: &BTreeMap<String, StateR
 }
 
 /// Add the action or conflict for `key` to `plan`, using the hashes `needs`
-/// asked for.
+/// asked for. `known` holds exactly those, so a missing one was not needed.
 fn decide<'k>(
     key: &'k str,
     local: &Scan,
@@ -253,16 +252,8 @@ fn decide<'k>(
         return;
     }
 
-    let needs = needs(key, local, remote, state);
-    let mut take = |needed: bool, side: Side| {
-        needed.then(|| {
-            known
-                .remove(&(side, key))
-                .expect("the pre-pass hashes every side `needs` names")
-        })
-    };
-    let lh = take(needs.local, Side::Local);
-    let rh = take(needs.remote, Side::Remote);
+    let lh = known.remove(&(Side::Local, key));
+    let rh = known.remove(&(Side::Remote, key));
 
     let copy = |from: Side, e: &Entry| Action::Copy {
         rel_path: key.to_string(),
@@ -596,15 +587,38 @@ mod tests {
 
     #[test]
     fn a_touched_but_unchanged_file_beside_a_resized_peer_still_copies() {
-        // Both suspect, one resized: both are hashed, and the untouched content
-        // on the remote side makes this a plain local edit.
+        // Both suspect, local resized: only the remote is read, and its
+        // untouched content makes this a plain local edit. The provider has no
+        // local hash, so reading the local file would fail the comparison.
         let local = scan_of(&[("a.txt", 12, 150)]);
         let remote = scan_of(&[("a.txt", 10, 999)]);
         let state = state_of(&[("a.txt", "h1", 10, 100, 10, 200)]);
-        let h = hashes(&[(Side::Local, "a.txt", "h2"), (Side::Remote, "a.txt", "h1")]);
+        let h = hashes(&[(Side::Remote, "a.txt", "h1")]);
         let plan = plan_of(&local, &remote, &state, &h);
         assert_eq!(plan.copy_count(Side::Remote), 1, "got: {:?}", plan.actions);
         assert!(plan.conflicts.is_empty());
+    }
+
+    #[test]
+    fn a_resized_file_beside_an_edited_peer_of_another_size_is_a_conflict() {
+        let local = scan_of(&[("a.txt", 12, 150)]);
+        let remote = scan_of(&[("a.txt", 10, 999)]);
+        let state = state_of(&[("a.txt", "h1", 10, 100, 10, 200)]);
+        let h = hashes(&[(Side::Remote, "a.txt", "hR")]);
+        let plan = plan_of(&local, &remote, &state, &h);
+        assert_eq!(plan.conflicts[0].kind, ConflictKind::BothEdited);
+    }
+
+    #[test]
+    fn a_resized_file_beside_a_peer_of_the_same_size_is_hashed_to_converge() {
+        // Both now 12 bytes: they may have been edited to the same content.
+        let local = scan_of(&[("a.txt", 12, 150)]);
+        let remote = scan_of(&[("a.txt", 12, 999)]);
+        let state = state_of(&[("a.txt", "h1", 10, 100, 12, 200)]);
+        let h = hashes(&[(Side::Local, "a.txt", "hX"), (Side::Remote, "a.txt", "hX")]);
+        let plan = plan_of(&local, &remote, &state, &h);
+        assert!(plan.conflicts.is_empty(), "got: {:?}", plan.conflicts);
+        assert!(plan.is_noop(), "got: {:?}", plan.actions);
     }
 
     #[test]

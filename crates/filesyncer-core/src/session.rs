@@ -71,8 +71,10 @@ impl Session {
     /// remote share) is walked while the local disk is.
     ///
     /// Frontends expect one phase at a time, so only the local scan reports
-    /// live. The remote scan's events queue up and are passed on once the
-    /// local phase has finished: by then its walk is often done or nearly so.
+    /// live. The remote scan's events wait in a bounded queue and are passed
+    /// on once the local phase has finished. While the queue is full its file
+    /// items are dropped, which a count-up display shows as a jump, but its
+    /// start and finish are always kept.
     fn scan_both(&self, reporter: &Reporter) -> Result<Option<(Scan, Scan)>> {
         let local_ignore = self.profile.local.join(IGNORE_FILE);
         let remote_ignore = self.profile.remote.join(IGNORE_FILE);
@@ -80,23 +82,39 @@ impl Session {
         // Set when the user cancels or the local scan fails, to stop the
         // remote walk early.
         let stop = AtomicBool::new(false);
-        let (tx, rx) = mpsc::channel::<Progress>();
+        // Set when the remote scan fails, to stop the local walk early rather
+        // than make the user wait it out before seeing the error.
+        let remote_failed = AtomicBool::new(false);
 
         // Borrowed apart from `self`, whose database connection is not `Sync`.
         let remote_root = &self.profile.remote;
 
         std::thread::scope(|scope| {
+            // Created inside the scope so that an early return drops the
+            // receiver before the scope joins, which releases a remote thread
+            // blocked sending into a full queue.
+            let (tx, rx) = mpsc::sync_channel::<Progress>(REMOTE_BACKLOG);
+
             let remote = scope.spawn(|| {
-                let sink = move |p| {
-                    let _ = tx.send(p);
+                let sink = move |p| match p {
+                    Progress::Item { .. } => {
+                        let _ = tx.try_send(p);
+                    }
+                    _ => {
+                        let _ = tx.send(p);
+                    }
                 };
                 let cancel = || stop.load(Ordering::Relaxed);
-                scan_root(
+                let result = scan_root(
                     remote_root,
                     std::slice::from_ref(&local_ignore),
                     Phase::ScanRemote,
                     &Reporter::new(&sink, &cancel),
-                )
+                );
+                if result.is_err() {
+                    remote_failed.store(true, Ordering::Relaxed);
+                }
+                result
             });
 
             let forward = |p| reporter.emit(p);
@@ -105,7 +123,7 @@ impl Session {
                 if cancelled {
                     stop.store(true, Ordering::Relaxed);
                 }
-                cancelled
+                cancelled || remote_failed.load(Ordering::Relaxed)
             };
             let local = scan_root(
                 &self.profile.local,
@@ -115,6 +133,9 @@ impl Session {
             );
             let local = match local {
                 Ok(Some(scan)) => scan,
+                Ok(None) if remote_failed.load(Ordering::Relaxed) => {
+                    return join(remote).map(|_| None);
+                }
                 other => {
                     stop.store(true, Ordering::Relaxed);
                     return other.map(|_| None);
@@ -129,15 +150,13 @@ impl Session {
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 }
-                if cancel() {
+                if reporter.cancelled() {
+                    stop.store(true, Ordering::Relaxed);
                     return Ok(None);
                 }
             }
 
-            let remote = remote
-                .join()
-                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))?;
-            Ok(remote.map(|remote| (local, remote)))
+            Ok(join(remote)?.map(|remote| (local, remote)))
         })
     }
 
@@ -168,6 +187,16 @@ impl Session {
     pub fn tracked_count(&self) -> Result<usize> {
         self.state.tracked_count()
     }
+}
+
+/// How many remote scan events may wait while the local scan reports.
+const REMOTE_BACKLOG: usize = 256;
+
+/// Join a scan thread, passing on its panic as this thread's.
+fn join<T>(handle: std::thread::ScopedJoinHandle<'_, T>) -> T {
+    handle
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
 }
 
 /// Validate a new profile and stamp both roots with markers.
@@ -433,6 +462,48 @@ mod tests {
             52,
             "every remote file reported, plus Started and Finished"
         );
+    }
+
+    #[test]
+    fn a_remote_tree_larger_than_the_backlog_still_finishes() {
+        let f = fixture();
+        f.write("local", "only.txt", "l");
+        let n = REMOTE_BACKLOG * 3;
+        for i in 0..n {
+            f.write("remote", &format!("r{i}.txt"), "r");
+        }
+        let events = std::cell::RefCell::new(Vec::new());
+        let sink = |p| events.borrow_mut().push(p);
+        let plan = f
+            .session()
+            .prepare(false, &Reporter::new(&sink, &|| false))
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.copy_count(crate::Side::Local), n);
+
+        let events = events.into_inner();
+        assert!(events.contains(&Progress::Started {
+            phase: Phase::ScanRemote,
+            total: None
+        }));
+        assert!(
+            events.contains(&Progress::Finished {
+                phase: Phase::ScanRemote,
+                count: n
+            }),
+            "the remote finish is never dropped"
+        );
+    }
+
+    #[test]
+    fn a_failing_remote_scan_fails_the_prepare() {
+        let f = fixture();
+        // The local ignore file also filters the remote scan, which cannot
+        // read it when it is a directory and reports a configuration error.
+        f.write("local", &format!("{IGNORE_FILE}/inner"), "x");
+        f.write("local", "a.txt", "x");
+        let err = f.session().prepare(false, &Reporter::silent()).unwrap_err();
+        assert!(matches!(err, crate::Error::Config(_)), "got: {err:?}");
     }
 
     /// Every file under `root`, as sorted (relative path, contents) pairs.
