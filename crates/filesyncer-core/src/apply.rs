@@ -1,4 +1,4 @@
-use crate::plan::{Action, Plan, Side};
+use crate::plan::{Action, Plan, Side, Stat};
 use crate::progress::{Phase, Reporter};
 use crate::scan::TRASH_DIR;
 use crate::state::{StateRow, StateStore};
@@ -16,6 +16,29 @@ const COPY_BUF: usize = 256 * 1024;
 /// the next scan rebuilds by hashing (see `apply`).
 const COMMIT_EVERY: usize = 500;
 
+/// The longest a batch of finished rows may wait to be committed.
+const COMMIT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Copies at least this big may take long enough that the rows before them
+/// are committed first, rather than left waiting out the transfer.
+const LARGE_COPY: u64 = 64 * 1024 * 1024;
+
+thread_local! {
+    /// One copy buffer per thread, reused across files.
+    static COPY_BUFFER: std::cell::RefCell<Vec<u8>> = std::cell::RefCell::new(vec![0; COPY_BUF]);
+}
+
+/// What `copy_atomic` read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Copied {
+    /// BLAKE3 of the bytes copied.
+    pub hash: String,
+    /// The source as it was when opened, before any byte was read. If the
+    /// source changes during the copy, its next stat will differ from this,
+    /// so the next scan sees the change instead of trusting `hash`.
+    pub source: Stat,
+}
+
 fn temp_path_for(dst: &Path) -> PathBuf {
     let name = dst.file_name().unwrap_or_default().to_string_lossy();
     dst.with_file_name(format!("{name}{TEMP_SUFFIX}-{}", std::process::id()))
@@ -23,17 +46,18 @@ fn temp_path_for(dst: &Path) -> PathBuf {
 
 /// Copy `src` over `dst` such that `dst` is never observed partially written.
 ///
-/// Returns the BLAKE3 hash of the bytes copied, computed in the same pass so
-/// the source is read once.
-pub fn copy_atomic(src: &Path, dst: &Path) -> Result<String> {
+/// The hash of the bytes copied is computed in the same pass, so the source is
+/// read once.
+pub fn copy_atomic(src: &Path, dst: &Path) -> Result<Copied> {
     if let Some(parent) = dst.parent() {
         std::fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
     }
     let tmp = temp_path_for(dst);
 
     // Scoped so both handles are closed before the rename.
-    let hash = {
+    let (hash, meta) = {
         let mut reader = std::fs::File::open(src).map_err(|e| Error::io(src, e))?;
+        let meta = reader.metadata().map_err(|e| Error::io(src, e))?;
         let mut writer = std::fs::File::create(&tmp).map_err(|e| Error::io(&tmp, e))?;
         let hash = match copy_hashing(&mut reader, &mut writer) {
             Ok(hash) => hash,
@@ -46,7 +70,7 @@ pub fn copy_atomic(src: &Path, dst: &Path) -> Result<String> {
             let _ = std::fs::remove_file(&tmp);
             return Err(Error::io(&tmp, e));
         }
-        hash
+        (hash, meta)
     };
 
     std::fs::rename(&tmp, dst).map_err(|e| {
@@ -54,10 +78,12 @@ pub fn copy_atomic(src: &Path, dst: &Path) -> Result<String> {
         Error::io(dst, e)
     })?;
 
-    let meta = std::fs::metadata(src).map_err(|e| Error::io(src, e))?;
     let mtime = filetime::FileTime::from_last_modification_time(&meta);
     filetime::set_file_mtime(dst, mtime).map_err(|e| Error::io(dst, e))?;
-    Ok(hash)
+    Ok(Copied {
+        hash,
+        source: stat_of_meta(&meta),
+    })
 }
 
 /// Which end of a copy failed, so the error names the right path.
@@ -79,19 +105,20 @@ fn copy_hashing(
     reader: &mut impl std::io::Read,
     writer: &mut impl std::io::Write,
 ) -> std::result::Result<String, CopyError> {
-    let mut buf = vec![0u8; COPY_BUF];
-    let mut hasher = blake3::Hasher::new();
-    loop {
-        let n = match reader.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(CopyError::Read(e)),
-        };
-        hasher.update(&buf[..n]);
-        writer.write_all(&buf[..n]).map_err(CopyError::Write)?;
-    }
-    Ok(crate::hash::to_hex(hasher))
+    COPY_BUFFER.with_borrow_mut(|buf| {
+        let mut hasher = blake3::Hasher::new();
+        loop {
+            let n = match reader.read(buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(CopyError::Read(e)),
+            };
+            hasher.update(&buf[..n]);
+            writer.write_all(&buf[..n]).map_err(CopyError::Write)?;
+        }
+        Ok(crate::hash::to_hex(hasher))
+    })
 }
 
 /// Move `root/rel_path` into `root/.filesyncer-trash/<run_stamp>/<rel_path>`.
@@ -167,18 +194,22 @@ impl ApplyCtx<'_> {
     }
 }
 
-fn stat_of_file(path: &Path) -> Result<crate::plan::Stat> {
+fn stat_of_file(path: &Path) -> Result<Stat> {
     let meta = std::fs::metadata(path).map_err(|e| Error::io(path, e))?;
+    Ok(stat_of_meta(&meta))
+}
+
+fn stat_of_meta(meta: &std::fs::Metadata) -> Stat {
     let mtime = meta
         .modified()
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    Ok(crate::plan::Stat {
+    Stat {
         size: meta.len(),
         mtime,
-    })
+    }
 }
 
 enum Outcome {
@@ -200,24 +231,27 @@ pub fn apply(plan: &Plan, ctx: &ApplyCtx, reporter: &Reporter) -> Result<RunSumm
     reporter.started(Phase::Apply, Some(total));
 
     let mut done = 0usize;
-    let mut last_commit = std::time::Instant::now();
 
     // State rows are written in batches, not one transaction per action. A
     // crash can therefore lose the rows of up to `COMMIT_EVERY` finished
     // actions, but never in a way that loses data: a copied file without a row
     // is new on both sides with equal content, so the next scan hashes both and
     // adopts it; a trashed file without its row removed is gone from both
-    // sides and the row is dropped. A clean finish or a cancel commits all.
-    ctx.state.begin()?;
+    // sides and the row is dropped. A clean finish or a cancel commits all; an
+    // error rolls the open batch back as the transaction drops.
+    let mut batch = ctx.state.begin()?;
+    let mut pending = 0usize;
+    let mut opened = std::time::Instant::now();
 
     for (index, action) in plan.actions.iter().enumerate() {
-        if index > 0
-            && (index.is_multiple_of(COMMIT_EVERY)
-                || last_commit.elapsed() > std::time::Duration::from_secs(2))
+        let large_copy = matches!(action, Action::Copy { size, .. } if *size >= LARGE_COPY);
+        if pending > 0
+            && (pending >= COMMIT_EVERY || opened.elapsed() > COMMIT_INTERVAL || large_copy)
         {
-            ctx.state.commit()?;
-            ctx.state.begin()?;
-            last_commit = std::time::Instant::now();
+            batch.commit()?;
+            batch = ctx.state.begin()?;
+            pending = 0;
+            opened = std::time::Instant::now();
         }
 
         if reporter.cancelled() {
@@ -234,6 +268,7 @@ pub fn apply(plan: &Plan, ctx: &ApplyCtx, reporter: &Reporter) -> Result<RunSumm
 
         reporter.item(Phase::Apply, index, &rel_path);
         done = index + 1;
+        pending += 1;
 
         let outcome = match action {
             Action::Copy { rel_path, from, .. } => {
@@ -273,7 +308,7 @@ pub fn apply(plan: &Plan, ctx: &ApplyCtx, reporter: &Reporter) -> Result<RunSumm
         }
     }
 
-    ctx.state.commit()?;
+    batch.commit()?;
     reporter.finished(Phase::Apply, done);
     Ok(summary)
 }
@@ -281,9 +316,10 @@ pub fn apply(plan: &Plan, ctx: &ApplyCtx, reporter: &Reporter) -> Result<RunSumm
 fn apply_copy(ctx: &ApplyCtx, rel_path: &str, from: Side) -> Result<()> {
     let src = ctx.root(from).join(rel_path);
     let dst = ctx.root(from.other()).join(rel_path);
-    let hash = copy_atomic(&src, &dst)?;
-
-    let src_stat = stat_of_file(&src)?;
+    let Copied {
+        hash,
+        source: src_stat,
+    } = copy_atomic(&src, &dst)?;
     let dst_stat = stat_of_file(&dst)?;
     let (local, remote) = match from {
         Side::Local => (src_stat, dst_stat),
@@ -354,7 +390,7 @@ mod tests {
         // Spans several buffers, with a ragged tail.
         let payload: Vec<u8> = (0..COPY_BUF * 3 + 17).map(|i| (i * 31) as u8).collect();
         std::fs::write(&src, &payload).unwrap();
-        let hash = copy_atomic(&src, &dir.path().join("dst.bin")).unwrap();
+        let hash = copy_atomic(&src, &dir.path().join("dst.bin")).unwrap().hash;
         assert_eq!(hash, crate::hash::hash_file(&src).unwrap());
         assert_eq!(std::fs::read(dir.path().join("dst.bin")).unwrap(), payload);
     }

@@ -75,16 +75,12 @@ impl StateStore {
         Ok(out)
     }
 
-    /// Open a transaction, so the writes until `commit` cost one sync, not
-    /// one each.
-    pub fn begin(&self) -> Result<()> {
-        self.conn.execute_batch("BEGIN")?;
-        Ok(())
-    }
-
-    pub fn commit(&self) -> Result<()> {
-        self.conn.execute_batch("COMMIT")?;
-        Ok(())
+    /// Open a transaction, so the writes until its `commit` cost one sync,
+    /// not one each. Dropping it uncommitted, including after a failed
+    /// commit, rolls it back, so an error never leaves the connection inside a
+    /// transaction that the next `begin` would trip over.
+    pub fn begin(&self) -> Result<rusqlite::Transaction<'_>> {
+        Ok(self.conn.unchecked_transaction()?)
     }
 
     pub fn upsert(&self, row: &StateRow) -> Result<()> {
@@ -209,15 +205,27 @@ mod tests {
     #[test]
     fn writes_inside_a_transaction_are_visible_after_commit() {
         let s = StateStore::open_in_memory().unwrap();
-        s.begin().unwrap();
+        let tx = s.begin().unwrap();
         s.upsert(&row("a.txt")).unwrap();
         s.remove("a.txt").unwrap();
         s.upsert(&row("b.txt")).unwrap();
-        s.commit().unwrap();
+        tx.commit().unwrap();
         assert_eq!(
             s.load_all().unwrap().keys().cloned().collect::<Vec<_>>(),
             vec!["b.txt".to_string()]
         );
+    }
+
+    #[test]
+    fn an_uncommitted_transaction_rolls_back_and_frees_the_connection() {
+        let s = StateStore::open_in_memory().unwrap();
+        {
+            let _tx = s.begin().unwrap();
+            s.upsert(&row("a.txt")).unwrap();
+        }
+        assert!(s.load_all().unwrap().is_empty());
+        let tx = s.begin().expect("no transaction may be left open");
+        tx.commit().unwrap();
     }
 
     #[test]
