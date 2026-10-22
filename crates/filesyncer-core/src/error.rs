@@ -28,6 +28,9 @@ pub enum Error {
 
     #[error("no conflict recorded for {0}")]
     NoSuchConflict(String),
+
+    #[error("that choice is not open for {0}")]
+    ChoiceUnavailable(String),
 }
 
 impl Error {

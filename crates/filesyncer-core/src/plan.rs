@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Side {
     Local,
@@ -69,6 +71,39 @@ pub struct Plan {
     pub actions: Vec<Action>,
     pub conflicts: Vec<Conflict>,
     pub skips: Vec<Skip>,
+    /// Every path the plan copies, trashes or flags, as it was on each side
+    /// when scanned. Kept when a path is skipped, so a frontend can still show
+    /// it and its choice can be changed back.
+    pub listed: BTreeMap<String, Listed>,
+}
+
+/// A path as the scan found it on each side.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Listed {
+    pub local: Option<Stat>,
+    pub remote: Option<Stat>,
+    /// Set when reconciliation could not decide the path itself.
+    pub conflict: Option<ConflictKind>,
+}
+
+impl Listed {
+    pub fn stat(&self, side: Side) -> Option<&Stat> {
+        match side {
+            Side::Local => self.local.as_ref(),
+            Side::Remote => self.remote.as_ref(),
+        }
+    }
+}
+
+/// What to do with one listed path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Choice {
+    /// Copy from this side over the other.
+    Copy(Side),
+    /// Move this side's file to the trash.
+    Trash(Side),
+    /// Leave both sides alone this run; the path is planned again next scan.
+    Skip,
 }
 
 impl Side {
@@ -114,6 +149,16 @@ impl Plan {
     }
 }
 
+/// The path an action concerns.
+pub fn action_path(action: &Action) -> &str {
+    match action {
+        Action::Copy { rel_path, .. }
+        | Action::Trash { rel_path, .. }
+        | Action::RecordState { rel_path, .. }
+        | Action::DropState { rel_path } => rel_path,
+    }
+}
+
 /// A plan deleting more than this share of tracked paths is refused.
 pub const DELETION_THRESHOLD_PCT: usize = 25;
 
@@ -130,6 +175,87 @@ impl Plan {
                 would_delete,
                 tracked,
             });
+        }
+        Ok(())
+    }
+
+    /// What the plan will do with a listed path.
+    pub fn choice(&self, rel_path: &str) -> Choice {
+        self.actions
+            .iter()
+            .find_map(|a| match a {
+                Action::Copy {
+                    rel_path: p, from, ..
+                } if p == rel_path => Some(Choice::Copy(*from)),
+                Action::Trash { rel_path: p, side } if p == rel_path => Some(Choice::Trash(*side)),
+                _ => None,
+            })
+            .unwrap_or(Choice::Skip)
+    }
+
+    /// The choices open for a listed path, in display order.
+    ///
+    /// A side's file can be copied over the other whenever it exists. It can be
+    /// trashed only when the other side has none: the state records the path
+    /// as on both sides, so trashing one of two copies would read as a
+    /// deletion next scan and trash the other too.
+    pub fn choices(&self, rel_path: &str) -> Vec<Choice> {
+        let Some(listed) = self.listed.get(rel_path) else {
+            return Vec::new();
+        };
+        // A file cannot be copied over a directory, nor its absence trusted.
+        if listed.conflict == Some(ConflictKind::TypeMismatch) {
+            return vec![Choice::Skip];
+        }
+        let mut out = Vec::new();
+        for side in [Side::Local, Side::Remote] {
+            if listed.stat(side).is_some() {
+                out.push(Choice::Copy(side));
+            }
+        }
+        for side in [Side::Local, Side::Remote] {
+            if listed.stat(side).is_some() && listed.stat(side.other()).is_none() {
+                out.push(Choice::Trash(side));
+            }
+        }
+        out.push(Choice::Skip);
+        out
+    }
+
+    /// Replace what the plan does with a listed path.
+    ///
+    /// Skipping a conflict leaves it flagged; choosing anything else for one
+    /// resolves it.
+    pub fn set_choice(&mut self, rel_path: &str, choice: Choice) -> crate::Result<()> {
+        if !self.choices(rel_path).contains(&choice) {
+            return Err(crate::Error::ChoiceUnavailable(rel_path.to_string()));
+        }
+        let listed = self.listed[rel_path].clone();
+        self.actions.retain(|a| {
+            !(action_path(a) == rel_path && matches!(a, Action::Copy { .. } | Action::Trash { .. }))
+        });
+        self.conflicts.retain(|c| c.rel_path != rel_path);
+
+        match choice {
+            Choice::Copy(from) => self.actions.push(Action::Copy {
+                rel_path: rel_path.to_string(),
+                from,
+                size: listed.stat(from).map_or(0, |s| s.size),
+            }),
+            Choice::Trash(side) => self.actions.push(Action::Trash {
+                rel_path: rel_path.to_string(),
+                side,
+            }),
+            Choice::Skip => {
+                if let Some(kind) = listed.conflict {
+                    self.conflicts.push(Conflict {
+                        rel_path: rel_path.to_string(),
+                        kind,
+                        local: listed.local,
+                        remote: listed.remote,
+                    });
+                }
+            }
         }
         Ok(())
     }
@@ -342,6 +468,132 @@ mod tests {
     fn an_empty_state_table_cannot_trip_the_threshold() {
         // First-ever run: nothing is tracked, so nothing can be a deletion.
         Plan::default().check_deletion_threshold(0).unwrap();
+    }
+
+    fn stat(size: u64) -> Option<Stat> {
+        Some(Stat { size, mtime: 1 })
+    }
+
+    /// A plan listing one path, with the given action or conflict for it.
+    fn listing(local: Option<Stat>, remote: Option<Stat>, action: Option<Action>) -> Plan {
+        let conflict = action.is_none().then_some(ConflictKind::BothEdited);
+        Plan {
+            actions: action.into_iter().collect(),
+            conflicts: conflict
+                .map(|kind| self::conflict("a.txt", kind, local.clone(), remote.clone()))
+                .into_iter()
+                .collect(),
+            listed: [(
+                "a.txt".to_string(),
+                Listed {
+                    local,
+                    remote,
+                    conflict,
+                },
+            )]
+            .into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_file_on_one_side_can_be_copied_trashed_or_skipped() {
+        let plan = listing(stat(5), None, Some(copy("a.txt", Side::Local, 5)));
+        assert_eq!(plan.choice("a.txt"), Choice::Copy(Side::Local));
+        assert_eq!(
+            plan.choices("a.txt"),
+            vec![
+                Choice::Copy(Side::Local),
+                Choice::Trash(Side::Local),
+                Choice::Skip
+            ]
+        );
+    }
+
+    #[test]
+    fn a_file_on_both_sides_cannot_have_one_copy_trashed() {
+        let plan = listing(stat(5), stat(6), Some(copy("a.txt", Side::Local, 5)));
+        assert_eq!(
+            plan.choices("a.txt"),
+            vec![
+                Choice::Copy(Side::Local),
+                Choice::Copy(Side::Remote),
+                Choice::Skip
+            ]
+        );
+        let mut plan = plan;
+        assert!(
+            plan.set_choice("a.txt", Choice::Trash(Side::Local))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn reversing_a_copy_sizes_it_from_the_other_side() {
+        let mut plan = listing(stat(5), stat(6), Some(copy("a.txt", Side::Local, 5)));
+        plan.set_choice("a.txt", Choice::Copy(Side::Remote))
+            .unwrap();
+        assert_eq!(plan.actions, vec![copy("a.txt", Side::Remote, 6)]);
+    }
+
+    #[test]
+    fn trashing_instead_of_copying_replaces_the_action() {
+        let mut plan = listing(stat(5), None, Some(copy("a.txt", Side::Local, 5)));
+        plan.set_choice("a.txt", Choice::Trash(Side::Local))
+            .unwrap();
+        assert_eq!(
+            plan.actions,
+            vec![Action::Trash {
+                rel_path: "a.txt".into(),
+                side: Side::Local
+            }]
+        );
+    }
+
+    #[test]
+    fn skipping_removes_the_action_but_keeps_the_path_listed() {
+        let mut plan = listing(stat(5), None, Some(copy("a.txt", Side::Local, 5)));
+        plan.set_choice("a.txt", Choice::Skip).unwrap();
+        assert!(plan.actions.is_empty());
+        assert_eq!(plan.choice("a.txt"), Choice::Skip);
+        plan.set_choice("a.txt", Choice::Copy(Side::Local)).unwrap();
+        assert_eq!(plan.actions, vec![copy("a.txt", Side::Local, 5)]);
+    }
+
+    #[test]
+    fn choosing_for_a_conflict_resolves_it_and_skipping_flags_it_again() {
+        let mut plan = listing(stat(5), stat(6), None);
+        assert_eq!(plan.choice("a.txt"), Choice::Skip);
+        plan.set_choice("a.txt", Choice::Copy(Side::Remote))
+            .unwrap();
+        assert!(plan.conflicts.is_empty());
+        plan.set_choice("a.txt", Choice::Skip).unwrap();
+        assert!(plan.actions.is_empty());
+        assert_eq!(plan.conflicts[0].kind, ConflictKind::BothEdited);
+    }
+
+    #[test]
+    fn state_rows_survive_a_change_of_choice() {
+        let mut plan = listing(stat(5), None, Some(copy("a.txt", Side::Local, 5)));
+        plan.actions.push(Action::DropState {
+            rel_path: "a.txt".into(),
+        });
+        plan.set_choice("a.txt", Choice::Skip).unwrap();
+        assert_eq!(plan.actions.len(), 1);
+    }
+
+    #[test]
+    fn a_type_mismatch_can_only_be_skipped() {
+        let mut plan = listing(stat(5), None, None);
+        plan.listed.get_mut("a.txt").unwrap().conflict = Some(ConflictKind::TypeMismatch);
+        assert_eq!(plan.choices("a.txt"), vec![Choice::Skip]);
+    }
+
+    #[test]
+    fn an_unlisted_path_has_no_choices() {
+        let mut plan = Plan::default();
+        assert!(plan.choices("ghost").is_empty());
+        assert!(plan.set_choice("ghost", Choice::Skip).is_err());
     }
 
     #[test]

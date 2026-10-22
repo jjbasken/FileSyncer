@@ -16,7 +16,8 @@ pub use error::{Error, Result};
 pub use eta::{Eta, Remaining, approx_duration};
 pub use marker::MARKER_FILE;
 pub use plan::{
-    Action, Conflict, ConflictKind, DELETION_THRESHOLD_PCT, Plan, Side, Skip, SkipReason, Stat,
+    Action, Choice, Conflict, ConflictKind, DELETION_THRESHOLD_PCT, Listed, Plan, Side, Skip,
+    SkipReason, Stat,
 };
 pub use profile::{Profile, ProfileSet};
 pub use progress::{Phase, Progress, Reporter};

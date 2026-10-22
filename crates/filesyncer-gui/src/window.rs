@@ -87,8 +87,8 @@ pub fn build(app: &adw::Application) -> Rc<AppWindow> {
     let window = adw::ApplicationWindow::builder()
         .application(app)
         .title("FileSyncer")
-        .default_width(900)
-        .default_height(600)
+        .default_width(1200)
+        .default_height(720)
         .content(&split)
         .build();
 

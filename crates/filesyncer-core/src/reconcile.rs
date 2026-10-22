@@ -1,4 +1,4 @@
-use crate::plan::{Action, Conflict, ConflictKind, Plan, Side, Skip, SkipReason, Stat};
+use crate::plan::{Action, Conflict, ConflictKind, Listed, Plan, Side, Skip, SkipReason, Stat};
 use crate::progress::{CANCEL_POLL, Phase, Reporter};
 use crate::scan::{Entry, Scan};
 use crate::state::StateRow;
@@ -110,7 +110,37 @@ pub fn reconcile(
     for key in keys {
         decide(key, local, remote, state, &mut known, &mut plan);
     }
+    list_paths(local, remote, &mut plan);
     Ok(Some(plan))
+}
+
+/// Record both sides of every path the plan copies, trashes or flags, so a
+/// frontend can show them side by side and offer other choices.
+fn list_paths(local: &Scan, remote: &Scan, plan: &mut Plan) {
+    let conflicts = plan
+        .conflicts
+        .iter()
+        .map(|c| (c.rel_path.as_str(), Some(c.kind)));
+    let work = plan.actions.iter().filter_map(|a| match a {
+        Action::Copy { rel_path, .. } | Action::Trash { rel_path, .. } => {
+            Some((rel_path.as_str(), None))
+        }
+        _ => None,
+    });
+    let listed: BTreeMap<String, Listed> = conflicts
+        .chain(work)
+        .map(|(path, conflict)| {
+            (
+                path.to_string(),
+                Listed {
+                    local: local.files.get(path).map(stat_of),
+                    remote: remote.files.get(path).map(stat_of),
+                    conflict,
+                },
+            )
+        })
+        .collect();
+    plan.listed = listed;
 }
 
 /// Hash every (side, path) in `jobs` on a pool of threads.
@@ -998,6 +1028,46 @@ mod tests {
         let h = hashes(&[(Side::Local, "a.txt", "hL"), (Side::Remote, "a.txt", "hR")]);
         let plan = plan_of(&local, &remote, &state, &h);
         assert_eq!(plan.conflicts[0].kind, ConflictKind::BothEdited);
+    }
+
+    #[test]
+    fn every_copy_trash_and_conflict_is_listed_with_both_sides() {
+        let local = scan_of(&[
+            ("new.txt", 5, 100),
+            ("both.txt", 10, 900),
+            ("kept.txt", 1, 1),
+        ]);
+        let remote = scan_of(&[("both.txt", 10, 901), ("kept.txt", 1, 1)]);
+        let state = state_of(&[
+            ("both.txt", "h1", 10, 100, 10, 200),
+            ("kept.txt", "h2", 1, 1, 1, 1),
+            ("gone.txt", "h3", 1, 1, 1, 1),
+        ]);
+        let h = hashes(&[
+            (Side::Local, "both.txt", "hL"),
+            (Side::Remote, "both.txt", "hR"),
+        ]);
+        let plan = plan_of(&local, &remote, &state, &h);
+        assert_eq!(
+            plan.listed.keys().collect::<Vec<_>>(),
+            vec!["both.txt", "new.txt"],
+            "unchanged and dropped paths are not listed"
+        );
+        assert_eq!(
+            plan.listed["new.txt"],
+            Listed {
+                local: Some(Stat {
+                    size: 5,
+                    mtime: 100
+                }),
+                remote: None,
+                conflict: None,
+            }
+        );
+        assert_eq!(
+            plan.listed["both.txt"].conflict,
+            Some(ConflictKind::BothEdited)
+        );
     }
 
     #[test]

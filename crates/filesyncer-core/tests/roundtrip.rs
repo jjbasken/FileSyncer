@@ -1,4 +1,4 @@
-use filesyncer_core::{Profile, Reporter, Session, Side, create_profile_roots};
+use filesyncer_core::{Choice, Profile, Reporter, Session, Side, create_profile_roots};
 use std::path::{Path, PathBuf};
 
 struct World {
@@ -352,7 +352,66 @@ fn verification_rechecks_a_pair_previously_adopted_by_quick_sync() {
         .prepare(false, filesyncer_core::Compare::Verify, &Reporter::silent())
         .unwrap()
         .unwrap();
-    assert_eq!(plan.copy_count(Side::Local), 1);
+    assert_eq!(plan.conflicts.len(), 1);
+    assert!(plan.actions.is_empty());
     assert_eq!(std::fs::read_to_string(w.local("a.txt")).unwrap(), "alpha");
     assert_eq!(std::fs::read_to_string(w.remote("a.txt")).unwrap(), "bravo");
+}
+
+#[test]
+fn trashing_a_new_file_instead_of_copying_it_settles() {
+    let w = world();
+    w.write(w.local("junk.txt"), "unwanted");
+
+    let s = w.session();
+    let mut plan = prepared(&s, false);
+    plan.set_choice("junk.txt", Choice::Trash(Side::Local))
+        .unwrap();
+    s.run(&plan, &Reporter::silent()).unwrap();
+
+    assert!(!w.local("junk.txt").exists());
+    assert!(!w.remote("junk.txt").exists());
+    assert!(prepared(&s, false).is_noop());
+}
+
+#[test]
+fn reversing_a_copy_restores_the_deleted_file() {
+    let w = world();
+    w.write(w.local("a.txt"), "keep me");
+    // Enough other files that one deletion stays under the safety threshold.
+    for i in 0..9 {
+        w.write(w.local(&format!("other{i}.txt")), "x");
+    }
+    w.sync();
+    std::fs::remove_file(w.remote("a.txt")).unwrap();
+
+    // The plan propagates the deletion; choosing to copy undoes it.
+    let s = w.session();
+    let mut plan = prepared(&s, false);
+    assert_eq!(plan.choice("a.txt"), Choice::Trash(Side::Local));
+    plan.set_choice("a.txt", Choice::Copy(Side::Local)).unwrap();
+    s.run(&plan, &Reporter::silent()).unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(w.remote("a.txt")).unwrap(),
+        "keep me"
+    );
+    assert!(prepared(&s, false).is_noop());
+}
+
+#[test]
+fn a_skipped_copy_is_planned_again() {
+    let w = world();
+    w.write(w.local("later.txt"), "not yet");
+
+    let s = w.session();
+    let mut plan = prepared(&s, false);
+    plan.set_choice("later.txt", Choice::Skip).unwrap();
+    s.run(&plan, &Reporter::silent()).unwrap();
+
+    assert!(!w.remote("later.txt").exists());
+    assert_eq!(
+        prepared(&s, false).choice("later.txt"),
+        Choice::Copy(Side::Local)
+    );
 }
