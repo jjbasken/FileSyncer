@@ -1,10 +1,12 @@
+use crate::plan_view::human_bytes;
 use crate::window::AppWindow;
 use adw::prelude::*;
-use filesyncer_core::{Plan, Progress, Reporter, RunSummary, Session};
+use filesyncer_core::{Eta, Plan, Progress, Reporter, RunSummary, Session, approx_duration};
 use gtk::glib;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 enum Message {
     Progress(Progress),
@@ -13,6 +15,9 @@ enum Message {
 
 pub fn show(aw: &Rc<AppWindow>, session: Rc<Session>, plan: Plan) {
     let profile = session.profile().clone();
+    // An unreadable rate only costs the estimate until this run measures one.
+    let estimate = session.estimate(&plan).ok().flatten();
+    let mut eta = Eta::new(&plan, estimate, Instant::now());
 
     let heading = gtk::Label::builder()
         .label("Syncing…")
@@ -24,6 +29,7 @@ pub fn show(aw: &Rc<AppWindow>, session: Rc<Session>, plan: Plan) {
         .css_classes(vec!["dim-label".to_string()])
         .build();
     let bar = gtk::ProgressBar::builder().show_text(true).build();
+    let remaining = gtk::Label::builder().label("").build();
     let cancel = gtk::Button::builder()
         .label("Cancel")
         .halign(gtk::Align::Center)
@@ -40,6 +46,7 @@ pub fn show(aw: &Rc<AppWindow>, session: Rc<Session>, plan: Plan) {
         .build();
     column.append(&heading);
     column.append(&bar);
+    column.append(&remaining);
     column.append(&current);
     column.append(&cancel);
 
@@ -81,28 +88,14 @@ pub fn show(aw: &Rc<AppWindow>, session: Rc<Session>, plan: Plan) {
 
     let aw = aw.clone();
     glib::spawn_future_local(async move {
-        let mut total = 0usize;
         while let Ok(message) = receiver.recv().await {
             match message {
-                // Applying always knows how much work it has, so the total is
-                // present; treat an absent one as zero rather than assuming.
-                Message::Progress(Progress::Started { total: n, .. }) => {
-                    total = n.unwrap_or(0);
-                    bar.set_fraction(0.0);
-                    bar.set_text(Some(&format!("0 / {total}")));
-                }
-                Message::Progress(Progress::Item {
-                    index, rel_path, ..
-                }) => {
-                    let done = index + 1;
-                    if total > 0 {
-                        bar.set_fraction(done as f64 / total as f64);
+                Message::Progress(progress) => {
+                    eta.observe(&progress);
+                    if let Progress::Item { rel_path, .. } = &progress {
+                        current.set_label(rel_path);
                     }
-                    bar.set_text(Some(&format!("{done} / {total}")));
-                    current.set_label(&rel_path);
-                }
-                Message::Progress(Progress::Finished { .. }) => {
-                    bar.set_fraction(1.0);
+                    show_remaining(&eta, &bar, &remaining);
                 }
                 Message::Done(result) => {
                     show_summary(&aw, result);
@@ -111,6 +104,37 @@ pub fn show(aw: &Rc<AppWindow>, session: Rc<Session>, plan: Plan) {
             }
         }
     });
+}
+
+/// Moves the bar by bytes when there are any, since one large file can be most
+/// of a sync, and by files otherwise.
+fn show_remaining(eta: &Eta, bar: &gtk::ProgressBar, label: &gtk::Label) {
+    let now = Instant::now();
+    let left = eta.remaining(now);
+    let files = eta.total_items();
+    let fraction = if eta.total_bytes() > 0 {
+        1.0 - left.bytes as f64 / eta.total_bytes() as f64
+    } else if files > 0 {
+        1.0 - left.items as f64 / files as f64
+    } else {
+        1.0
+    };
+    bar.set_fraction(fraction);
+    bar.set_text(Some(&format!("{} / {files} files", files - left.items)));
+
+    let time = match left.time {
+        Some(t) => format!("{} left", approx_duration(t)),
+        None => "estimating time…".to_string(),
+    };
+    let mut text = format!(
+        "{} files · {} · {time}",
+        left.items,
+        human_bytes(left.bytes)
+    );
+    if let Some(rate) = eta.rate(now).filter(|_| left.bytes > 0) {
+        text.push_str(&format!(" · {}/s", human_bytes(rate as u64)));
+    }
+    label.set_label(&text);
 }
 
 fn show_summary(aw: &Rc<AppWindow>, result: Result<RunSummary, String>) {

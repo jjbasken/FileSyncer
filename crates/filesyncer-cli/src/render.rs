@@ -1,26 +1,53 @@
-use filesyncer_core::{Action, ConflictKind, Phase, Plan, Progress, RunSummary, Side, SkipReason};
+use filesyncer_core::eta::is_work;
+use filesyncer_core::{
+    Action, ConflictKind, Eta, Phase, Plan, Progress, Remaining, RunSummary, Side, SkipReason,
+    approx_duration,
+};
 use std::io::Write;
 use std::time::{Duration, Instant};
 
 /// How often the interactive status line may be redrawn.
 const REDRAW_INTERVAL: Duration = Duration::from_millis(100);
 
+/// One line of a terminal that is rewritten in place.
+struct StatusLine<W: Write> {
+    out: W,
+    /// Length of the line currently on screen, so it can be blanked.
+    drawn: usize,
+}
+
+impl<W: Write> StatusLine<W> {
+    fn draw(&mut self, text: &str) -> std::io::Result<()> {
+        // Pad to the previous width so a shorter line does not leave debris.
+        let pad = self.drawn.saturating_sub(text.chars().count());
+        write!(self.out, "\r{text}{:pad$}", "", pad = pad)?;
+        self.drawn = text.chars().count();
+        self.out.flush()
+    }
+
+    fn clear(&mut self) -> std::io::Result<()> {
+        if self.drawn > 0 {
+            write!(self.out, "\r{:width$}\r", "", width = self.drawn)?;
+            self.drawn = 0;
+            self.out.flush()?;
+        }
+        Ok(())
+    }
+}
+
 /// Renders scan progress. Written against an injected writer and an explicit
 /// TTY flag so both output shapes are testable without a terminal.
 pub struct ScanReporter<W: Write> {
-    out: W,
+    line: StatusLine<W>,
     tty: bool,
-    /// Length of the status line currently on screen, so it can be blanked.
-    drawn: usize,
     last_draw: Option<Instant>,
 }
 
 impl<W: Write> ScanReporter<W> {
     pub fn new(out: W, tty: bool) -> Self {
         ScanReporter {
-            out,
+            line: StatusLine { out, drawn: 0 },
             tty,
-            drawn: 0,
             last_draw: None,
         }
     }
@@ -55,40 +82,141 @@ impl<W: Write> ScanReporter<W> {
                     return Ok(());
                 }
                 self.last_draw = Some(now);
-                self.status_line(&format!(
+                self.line.draw(&format!(
                     "{}… {} files  {rel_path}",
                     phase.label(),
                     commas(index + 1)
                 ))
             }
 
+            // Scans and comparisons move no file content.
+            Progress::Bytes { .. } => Ok(()),
+
             Progress::Finished { phase, count } => {
                 self.last_draw = None;
                 if self.tty {
-                    self.clear_line()
+                    self.line.clear()
                 } else {
-                    writeln!(self.out, "{}… {}", phase.label(), summarise(phase, count))
+                    writeln!(
+                        self.line.out,
+                        "{}… {}",
+                        phase.label(),
+                        summarise(phase, count)
+                    )
                 }
             }
         }
     }
+}
 
-    fn status_line(&mut self, text: &str) -> std::io::Result<()> {
-        // Pad to the previous width so a shorter line does not leave debris.
-        let pad = self.drawn.saturating_sub(text.chars().count());
-        write!(self.out, "\r{text}{:pad$}", "", pad = pad)?;
-        self.drawn = text.chars().count();
-        self.out.flush()
-    }
+/// Renders a sync as it applies: one line per file copied or trashed, and on a
+/// terminal a status line beneath them with what is left and how long it
+/// should take.
+pub struct ApplyReporter<'p, W: Write> {
+    line: StatusLine<W>,
+    tty: bool,
+    plan: &'p Plan,
+    eta: Eta,
+    last_draw: Option<Instant>,
+}
 
-    fn clear_line(&mut self) -> std::io::Result<()> {
-        if self.drawn > 0 {
-            write!(self.out, "\r{:width$}\r", "", width = self.drawn)?;
-            self.drawn = 0;
-            self.out.flush()?;
+impl<'p, W: Write> ApplyReporter<'p, W> {
+    /// `estimate` is how long the whole plan was expected to take.
+    pub fn new(out: W, tty: bool, plan: &'p Plan, estimate: Option<Duration>) -> Self {
+        ApplyReporter {
+            line: StatusLine { out, drawn: 0 },
+            tty,
+            plan,
+            eta: Eta::new(plan, estimate, Instant::now()),
+            last_draw: None,
         }
-        Ok(())
     }
+
+    pub fn handle(&mut self, event: Progress) {
+        let _ = self.write(event, Instant::now());
+    }
+
+    fn write(&mut self, event: Progress, now: Instant) -> std::io::Result<()> {
+        self.eta.observe(&event);
+        match event {
+            Progress::Item {
+                index, rel_path, ..
+            } => {
+                // State rows are bookkeeping, not files the user would count.
+                if !self.plan.actions.get(index).is_some_and(is_work) {
+                    return Ok(());
+                }
+                let left = self.eta.remaining(now);
+                let number = self.eta.total_items() - left.items + 1;
+                self.line.clear()?;
+                write!(
+                    self.line.out,
+                    "[{number}/{}] {rel_path}",
+                    self.eta.total_items()
+                )?;
+                if self.tty {
+                    writeln!(self.line.out)?;
+                    self.redraw(now)
+                } else {
+                    // A log gets what is left on each line, there being no
+                    // status line to carry it.
+                    writeln!(self.line.out, "  ({})", remaining_text(&left))
+                }
+            }
+            Progress::Bytes { .. } if self.tty => {
+                if self
+                    .last_draw
+                    .is_some_and(|t| now.duration_since(t) < REDRAW_INTERVAL)
+                {
+                    return Ok(());
+                }
+                self.redraw(now)
+            }
+            Progress::Finished { .. } => self.line.clear(),
+            _ => Ok(()),
+        }
+    }
+
+    fn redraw(&mut self, now: Instant) -> std::io::Result<()> {
+        self.last_draw = Some(now);
+        let mut text = format!("    {}", remaining_text(&self.eta.remaining(now)));
+        if let Some(rate) = self.eta.rate(now) {
+            text.push_str(&format!(" · {}/s", human_bytes(rate as u64)));
+        }
+        self.line.draw(&text)
+    }
+}
+
+/// "33 files, 7.1 GB · about 3 min left"
+fn remaining_text(left: &Remaining) -> String {
+    let files = if left.items == 1 { "file" } else { "files" };
+    let time = match left.time {
+        Some(t) => format!("{} left", approx_duration(t)),
+        None => "estimating time".to_string(),
+    };
+    format!(
+        "{} {files}, {} · {time}",
+        commas(left.items),
+        human_bytes(left.bytes)
+    )
+}
+
+/// The plan's work in one line, with how long it should take.
+pub fn plan_total(plan: &Plan, estimate: Option<Duration>) -> String {
+    let files = plan.actions.iter().filter(|a| is_work(a)).count();
+    if files == 0 {
+        return String::new();
+    }
+    let bytes = plan.copy_bytes(Side::Local) + plan.copy_bytes(Side::Remote);
+    let time = match estimate {
+        Some(t) => approx_duration(t),
+        None => "time unknown until a sync has measured the speed".to_string(),
+    };
+    format!(
+        "Total  {} files, {} · {time}\n",
+        commas(files),
+        human_bytes(bytes)
+    )
 }
 
 fn summarise(phase: Phase, count: usize) -> String {
@@ -358,7 +486,7 @@ mod tests {
                 ("a.txt".into(), "permission denied".into()),
                 ("b.txt".into(), "no space left".into()),
             ],
-            cancelled: false,
+            ..Default::default()
         };
         let text = run_summary(&summary);
         assert!(text.contains("a.txt: permission denied"), "got: {text}");
@@ -388,7 +516,7 @@ mod tests {
         for e in events {
             reporter.handle(e);
         }
-        String::from_utf8(reporter.out).unwrap()
+        String::from_utf8(reporter.line.out).unwrap()
     }
 
     #[test]
@@ -526,7 +654,7 @@ mod tests {
         reporter.last_draw = None;
         reporter.write(item(Phase::ScanLocal, 1, "b.txt")).unwrap();
 
-        let text = String::from_utf8(reporter.out).unwrap();
+        let text = String::from_utf8(reporter.line.out).unwrap();
         let last = text.rsplit('\r').next().unwrap();
         assert!(last.contains("b.txt"), "got: {last:?}");
         assert!(
@@ -572,5 +700,94 @@ mod tests {
         let text = run_summary(&summary);
         assert!(text.contains('2'), "got: {text}");
         assert!(text.to_lowercase().contains("conflict"), "got: {text}");
+    }
+
+    #[test]
+    fn the_plan_total_gives_files_size_and_time() {
+        let plan = Plan {
+            actions: vec![
+                copy("a.txt", Side::Local, 3 * 1024 * 1024 * 1024),
+                Action::DropState {
+                    rel_path: "r".into(),
+                },
+            ],
+            ..Default::default()
+        };
+        let text = plan_total(&plan, Some(Duration::from_secs(240)));
+        assert_eq!(text, "Total  1 files, 3.0 GB · about 4 min\n");
+        let unknown = plan_total(&plan, None);
+        assert!(unknown.contains("time unknown"), "got: {unknown}");
+    }
+
+    #[test]
+    fn a_plan_with_no_work_has_no_total() {
+        assert_eq!(plan_total(&Plan::default(), None), "");
+    }
+
+    fn apply_driven(tty: bool, plan: &Plan, events: Vec<Progress>) -> String {
+        let mut reporter = ApplyReporter::new(Vec::new(), tty, plan, None);
+        let now = Instant::now();
+        for e in events {
+            reporter.write(e, now).unwrap();
+        }
+        String::from_utf8(reporter.line.out).unwrap()
+    }
+
+    fn apply_item(index: usize, rel_path: &str) -> Progress {
+        item(Phase::Apply, index, rel_path)
+    }
+
+    #[test]
+    fn applying_numbers_files_and_says_what_is_left_without_listing_state_rows() {
+        let plan = Plan {
+            actions: vec![
+                Action::DropState {
+                    rel_path: "row".into(),
+                },
+                copy("a.txt", Side::Remote, 2048),
+                copy("b.txt", Side::Remote, 1024),
+            ],
+            ..Default::default()
+        };
+        let text = apply_driven(
+            false,
+            &plan,
+            vec![
+                apply_item(0, "row"),
+                apply_item(1, "a.txt"),
+                apply_item(2, "b.txt"),
+            ],
+        );
+        assert_eq!(
+            text,
+            "[1/2] a.txt  (2 files, 3.0 KB · estimating time)\n\
+             [2/2] b.txt  (1 file, 3.0 KB · estimating time)\n"
+        );
+    }
+
+    #[test]
+    fn on_a_terminal_what_is_left_stays_on_a_status_line_below_the_files() {
+        let plan = Plan {
+            actions: vec![copy("a.txt", Side::Remote, 2048)],
+            ..Default::default()
+        };
+        let text = apply_driven(
+            true,
+            &plan,
+            vec![
+                apply_item(0, "a.txt"),
+                Progress::Bytes {
+                    phase: Phase::Apply,
+                    done: 1024,
+                    total: 2048,
+                },
+            ],
+        );
+        assert!(text.starts_with("[1/1] a.txt\n"), "got: {text:?}");
+        // The redraw within the throttle is skipped, so 2.0 KB stays.
+        assert!(
+            text.ends_with("1 file, 2.0 KB · estimating time"),
+            "got: {text:?}"
+        );
     }
 }

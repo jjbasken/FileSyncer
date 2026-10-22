@@ -22,10 +22,13 @@ Each run follows a **scan → review → apply** cycle:
    A trusted pair has no recorded hash until it is verified or copied, so a
    change to its mtime alone on one side makes that side count as edited.
 2. **Review** the resulting plan: what will be copied in each direction, what
-   will be trashed, and which paths are in conflict. Nothing has happened yet.
+   will be trashed, and which paths are in conflict, with a total and how long
+   it should take at the speed the previous sync measured in each direction.
+   Nothing has happened yet.
 3. **Apply** the plan. Copies are atomic (temp file + rename), each file's state
    is committed as it completes, and per-file errors are reported without
    aborting the run — so an interrupted sync resumes exactly where it stopped.
+   Progress shows the files, bytes and time left, and the current speed.
 
 Highlights:
 

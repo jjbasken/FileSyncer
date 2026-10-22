@@ -157,6 +157,8 @@ fn cmd_sync(
         .expect("the CLI never cancels a scan");
 
     print!("{}", render::plan_summary(&plan));
+    let estimate = session.estimate(&plan).map_err(|e| e.to_string())?;
+    print!("{}", render::plan_total(&plan, estimate));
 
     let conflicts_present = !plan.conflicts.is_empty();
 
@@ -179,18 +181,15 @@ fn cmd_sync(
         return Ok(EXIT_OK);
     }
 
-    let total = std::cell::Cell::new(0usize);
-    let apply_progress = |p| match p {
-        filesyncer_core::Progress::Started { total: n, .. } => total.set(n.unwrap_or(0)),
-        filesyncer_core::Progress::Item {
-            index, rel_path, ..
-        } => {
-            println!("[{}/{}] {rel_path}", index + 1, total.get());
-        }
-        filesyncer_core::Progress::Finished { .. } => {}
-    };
+    let applying = std::cell::RefCell::new(render::ApplyReporter::new(
+        std::io::stdout(),
+        std::io::stdout().is_terminal(),
+        &plan,
+        estimate,
+    ));
+    let sink = |p| applying.borrow_mut().handle(p);
     let summary = session
-        .run(&plan, &Reporter::new(&apply_progress, &|| false))
+        .run(&plan, &Reporter::new(&sink, &|| false))
         .map_err(|e| e.to_string())?;
 
     print!("{}", render::run_summary(&summary));

@@ -1,3 +1,4 @@
+use crate::plan::Side;
 use crate::{Error, Result};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -122,23 +123,45 @@ impl StateStore {
     }
 
     pub fn last_sync(&self) -> Result<Option<i64>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT value FROM meta WHERE key = 'last_sync'")?;
-        let mut rows = stmt.query([])?;
+        self.meta("last_sync")
+    }
+
+    pub fn set_last_sync(&self, ts: i64) -> Result<()> {
+        self.set_meta("last_sync", ts)
+    }
+
+    /// The copy rate last measured into `to`, in bytes per second.
+    pub fn rate(&self, to: Side) -> Result<Option<u64>> {
+        Ok(self.meta(rate_key(to))?.map(|r| r as u64))
+    }
+
+    pub fn set_rate(&self, to: Side, bytes_per_sec: u64) -> Result<()> {
+        self.set_meta(rate_key(to), bytes_per_sec as i64)
+    }
+
+    fn meta(&self, key: &str) -> Result<Option<i64>> {
+        let mut stmt = self.conn.prepare("SELECT value FROM meta WHERE key = ?1")?;
+        let mut rows = stmt.query([key])?;
         match rows.next()? {
             Some(r) => Ok(Some(r.get(0)?)),
             None => Ok(None),
         }
     }
 
-    pub fn set_last_sync(&self, ts: i64) -> Result<()> {
+    fn set_meta(&self, key: &str, value: i64) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO meta (key, value) VALUES ('last_sync', ?1)
+            "INSERT INTO meta (key, value) VALUES (?1, ?2)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            [ts],
+            rusqlite::params![key, value],
         )?;
         Ok(())
+    }
+}
+
+fn rate_key(to: Side) -> &'static str {
+    match to {
+        Side::Local => "rate_to_local",
+        Side::Remote => "rate_to_remote",
     }
 }
 
@@ -172,6 +195,17 @@ mod tests {
         let all = s.load_all().unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(all["a.txt"], row("a.txt"));
+    }
+
+    #[test]
+    fn rates_are_kept_per_direction() {
+        let s = StateStore::open_in_memory().unwrap();
+        assert_eq!(s.rate(Side::Local).unwrap(), None);
+        s.set_rate(Side::Local, 40_000_000).unwrap();
+        s.set_rate(Side::Remote, 9_000_000).unwrap();
+        s.set_rate(Side::Remote, 11_000_000).unwrap();
+        assert_eq!(s.rate(Side::Local).unwrap(), Some(40_000_000));
+        assert_eq!(s.rate(Side::Remote).unwrap(), Some(11_000_000));
     }
 
     #[test]

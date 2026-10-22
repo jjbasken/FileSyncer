@@ -1,6 +1,7 @@
 use crate::apply::{ApplyCtx, RunSummary, apply, run_stamp_now};
+use crate::eta;
 use crate::marker;
-use crate::plan::Plan;
+use crate::plan::{Plan, Side};
 use crate::profile::Profile;
 use crate::progress::{CANCEL_POLL, Phase, Progress, Reporter};
 use crate::reconcile::{Compare, FsHashProvider, reconcile};
@@ -10,6 +11,7 @@ use crate::{Result, profile};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::time::Duration;
 
 #[derive(Debug)]
 pub struct Session {
@@ -174,6 +176,15 @@ impl Session {
         };
         let summary = apply(plan, &ctx, reporter)?;
 
+        // A cancelled run still measured the copies it finished.
+        for to in [Side::Local, Side::Remote] {
+            let transfer = summary.transfer(to);
+            if transfer.time >= MIN_RATE_SAMPLE {
+                let rate = transfer.bytes as f64 / transfer.time.as_secs_f64();
+                self.state.set_rate(to, rate as u64)?;
+            }
+        }
+
         // Only a run that finished represents a synchronised moment in time.
         if !summary.cancelled {
             let now = std::time::SystemTime::now()
@@ -189,10 +200,24 @@ impl Session {
         self.state.last_sync()
     }
 
+    /// How long applying `plan` should take, at the rates the last sync
+    /// measured. `None` until a sync has copied enough to measure.
+    pub fn estimate(&self, plan: &Plan) -> Result<Option<Duration>> {
+        Ok(eta::estimate(
+            plan,
+            self.state.rate(Side::Local)?,
+            self.state.rate(Side::Remote)?,
+        ))
+    }
+
     pub fn tracked_count(&self) -> Result<usize> {
         self.state.tracked_count()
     }
 }
+
+/// The least copying time in one direction that is trusted as a rate. Shorter
+/// runs are mostly the cost of opening files, not of moving bytes.
+const MIN_RATE_SAMPLE: Duration = Duration::from_secs(1);
 
 /// How many remote scan events may wait while the local scan reports.
 const REMOTE_BACKLOG: usize = 256;
@@ -454,6 +479,7 @@ mod tests {
             .map(|e| match e {
                 Progress::Started { phase, .. }
                 | Progress::Item { phase, .. }
+                | Progress::Bytes { phase, .. }
                 | Progress::Finished { phase, .. } => phase,
             })
             .collect();

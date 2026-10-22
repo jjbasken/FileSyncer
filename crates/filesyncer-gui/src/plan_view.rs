@@ -1,7 +1,10 @@
 use crate::run_view;
 use crate::window::AppWindow;
 use adw::prelude::*;
-use filesyncer_core::{Action, Conflict, ConflictKind, Plan, Session, Side, SkipReason};
+use filesyncer_core::eta::is_work;
+use filesyncer_core::{
+    Action, Conflict, ConflictKind, Plan, Session, Side, SkipReason, approx_duration,
+};
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -25,6 +28,24 @@ fn render(aw: &Rc<AppWindow>, session: Rc<Session>, plan: Rc<RefCell<Plan>>) {
 
     {
         let p = plan.borrow();
+
+        let files = p.actions.iter().filter(|a| is_work(a)).count();
+        if files > 0 {
+            let bytes = p.copy_bytes(Side::Local) + p.copy_bytes(Side::Remote);
+            // An unreadable rate only costs the estimate, not the review.
+            let time = match session.estimate(&p).ok().flatten() {
+                Some(t) => approx_duration(t),
+                None => "time unknown until a sync has measured the speed".to_string(),
+            };
+            let group = adw::PreferencesGroup::new();
+            group.add(
+                &adw::ActionRow::builder()
+                    .title("Total")
+                    .subtitle(format!("{files} files · {} · {time}", human_bytes(bytes)))
+                    .build(),
+            );
+            column.append(&group);
+        }
 
         for (side, label) in [
             (Side::Remote, "Copy to remote"),
@@ -237,7 +258,7 @@ fn labelled_row(title: &str, subtitle: &str) -> adw::ActionRow {
         .build()
 }
 
-fn human_bytes(bytes: u64) -> String {
+pub(crate) fn human_bytes(bytes: u64) -> String {
     const KB: f64 = 1024.0;
     let b = bytes as f64;
     if b < KB {

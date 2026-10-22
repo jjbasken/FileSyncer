@@ -143,6 +143,8 @@ pub fn show(aw: &Rc<AppWindow>, session: Rc<Session>, compare: Compare) {
                         bar.set_fraction(1.0);
                     }
                 }
+                // Scanning and comparing move no file content.
+                Message::Progress(Progress::Bytes { .. }) => {}
                 Message::Done(Ok(Some(plan))) => {
                     plan_view::show(&aw, session, plan);
                     break;
