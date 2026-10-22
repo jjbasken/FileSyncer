@@ -235,10 +235,10 @@ pub fn apply(plan: &Plan, ctx: &ApplyCtx, reporter: &Reporter) -> Result<RunSumm
     // State rows are written in batches, not one transaction per action. A
     // crash can therefore lose the rows of up to `COMMIT_EVERY` finished
     // actions, but never in a way that loses data: a copied file without a row
-    // is new on both sides with equal content, so the next scan hashes both and
-    // adopts it; a trashed file without its row removed is gone from both
-    // sides and the row is dropped. A clean finish or a cancel commits all; an
-    // error rolls the open batch back as the transaction drops.
+    // is new on both sides with equal content, so the next scan adopts it; a
+    // trashed file without its row removed is gone from both sides and the row
+    // is dropped. A clean finish or a cancel commits all; an error rolls the
+    // open batch back as the transaction drops.
     let mut batch = ctx.state.begin()?;
     let mut pending = 0usize;
     let mut opened = std::time::Instant::now();
@@ -328,7 +328,7 @@ fn apply_copy(ctx: &ApplyCtx, rel_path: &str, from: Side) -> Result<()> {
 
     ctx.state.upsert(&StateRow {
         rel_path: rel_path.to_string(),
-        hash,
+        hash: Some(hash),
         local_size: local.size,
         local_mtime: local.mtime,
         remote_size: remote.size,
@@ -571,7 +571,7 @@ mod tests {
         let row = &f.state.load_all().unwrap()["a.txt"];
         assert_eq!(
             row.hash,
-            crate::hash::hash_file(&f.local.join("a.txt")).unwrap()
+            Some(crate::hash::hash_file(&f.local.join("a.txt")).unwrap())
         );
         assert_eq!(row.local_size, 7);
         assert_eq!(row.remote_size, 7);
@@ -628,9 +628,9 @@ mod tests {
         let row = &f.state.load_all().unwrap()["a.txt"];
         assert_eq!(
             row.hash,
-            crate::hash::hash_file(&f.local.join("a.txt")).unwrap()
+            Some(crate::hash::hash_file(&f.local.join("a.txt")).unwrap())
         );
-        assert!(!row.hash.is_empty());
+        assert!(row.hash.as_ref().is_some_and(|h| !h.is_empty()));
     }
 
     #[test]
@@ -640,7 +640,7 @@ mod tests {
         f.state
             .upsert(&StateRow {
                 rel_path: "a.txt".into(),
-                hash: "h".into(),
+                hash: Some("h".into()),
                 local_size: 3,
                 local_mtime: 1,
                 remote_size: 3,
@@ -672,7 +672,7 @@ mod tests {
         let plan = Plan {
             actions: vec![Action::RecordState {
                 rel_path: "a.txt".into(),
-                hash: "h9".into(),
+                hash: Some("h9".into()),
                 local: Stat {
                     size: 20,
                     mtime: 900,
@@ -687,7 +687,7 @@ mod tests {
         let summary = run(&plan, &f);
         assert_eq!(summary.copied, 0);
         let row = &f.state.load_all().unwrap()["a.txt"];
-        assert_eq!(row.hash, "h9");
+        assert_eq!(row.hash.as_deref(), Some("h9"));
         assert_eq!(row.remote_mtime, 901);
     }
 
@@ -697,7 +697,7 @@ mod tests {
         f.state
             .upsert(&StateRow {
                 rel_path: "a.txt".into(),
-                hash: "h".into(),
+                hash: Some("h".into()),
                 local_size: 1,
                 local_mtime: 1,
                 remote_size: 1,

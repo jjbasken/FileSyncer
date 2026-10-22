@@ -15,8 +15,8 @@ const MAX_HASH_THREADS: usize = 8;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Compare {
     /// Equal size and mtime are taken as equal content, as rsync does by
-    /// default. Only the local copy is read, for the hash the state records;
-    /// on a first sync against a slow share that skips reading the share.
+    /// default, and neither copy is read: the state records the pair without
+    /// a hash. On a first sync that skips reading either tree.
     #[default]
     Quick,
     /// Read every existing copy of paired or tracked files, even when its
@@ -195,10 +195,11 @@ fn hash_all<'k>(
 ///
 /// This function alone chooses between reading a file and settling the path
 /// from its size: `hash_all` reads exactly what it names, and `decide` reads
-/// a missing hash as "resized, so changed", or for a pair with nothing
-/// recorded, as "trusted on size and mtime". A size that differs from the recorded one proves the content
-/// changed (the recorded hash was taken of a file of the recorded size); a
-/// changed mtime alone does not.
+/// a missing hash as "settled, so changed", or for a pair with nothing
+/// recorded, as "trusted on size and mtime". A size that differs from the
+/// recorded one proves the content changed (the recorded hash was taken of a
+/// file of the recorded size); a changed mtime alone does not, unless no hash
+/// was recorded to compare against.
 fn needs(
     key: &str,
     local: &Scan,
@@ -222,42 +223,41 @@ fn needs(
     match (local.files.get(key), remote.files.get(key), state.get(key)) {
         (Some(l), Some(r), Some(s)) => match (local_suspect(l, s), remote_suspect(r, s)) {
             (false, false) => Needs::NONE,
-            // A resized side has certainly changed and the other has not, so
-            // it is copied; the copy hashes it.
+            // A settled side has changed and the other has not, so it is
+            // copied; the copy hashes it.
             (true, false) => Needs {
-                local: !local_resized(l, s),
+                local: !local_settled(l, s),
                 remote: false,
             },
             (false, true) => Needs {
                 local: false,
-                remote: !remote_resized(r, s),
+                remote: !remote_settled(r, s),
             },
-            // Both touched. A resized side has changed, and its hash only
+            // Both touched. A settled side has changed, and its hash only
             // matters if the other side changed too and might hold the same
             // bytes, which takes equal sizes.
             (true, true) => Needs {
-                local: !local_resized(l, s) || l.size == r.size,
-                remote: !remote_resized(r, s) || l.size == r.size,
+                local: !local_settled(l, s) || l.size == r.size,
+                remote: !remote_settled(r, s) || l.size == r.size,
             },
         },
         // Nothing recorded: only equal sizes can be equal content. A pair whose
-        // mtimes match too is trusted unless verifying, and only the local
-        // copy is read, for the hash to record.
+        // mtimes match too is trusted unless verifying, and neither is read.
         (Some(l), Some(r), None) => {
             let same_size = l.size == r.size;
             let trusted = compare == Compare::Quick && same_size && l.mtime == r.mtime;
             Needs {
-                local: same_size,
+                local: same_size && !trusted,
                 remote: same_size && !trusted,
             }
         }
         (Some(l), None, Some(s)) => Needs {
-            local: local_suspect(l, s) && !local_resized(l, s),
+            local: local_suspect(l, s) && !local_settled(l, s),
             remote: false,
         },
         (None, Some(r), Some(s)) => Needs {
             local: false,
-            remote: remote_suspect(r, s) && !remote_resized(r, s),
+            remote: remote_suspect(r, s) && !remote_settled(r, s),
         },
         // New on one side: copied, and hashed by the copy.
         (Some(_), None, None) | (None, Some(_), None) => Needs::NONE,
@@ -302,15 +302,15 @@ fn decide<'k>(
         local: l.map(stat_of),
         remote: r.map(stat_of),
     };
-    let record = |hash: String, l: &Entry, r: &Entry| Action::RecordState {
+    let record = |hash: Option<String>, l: &Entry, r: &Entry| Action::RecordState {
         rel_path: key.to_string(),
         hash,
         local: stat_of(l),
         remote: stat_of(r),
     };
-    // A suspect side with no hash was resized, which settles it as changed.
+    // A suspect side with no hash was settled as changed without reading it.
     let changed = |suspect: bool, hash: &Option<String>, s: &StateRow| {
-        (suspect || hash.is_some()) && hash.as_ref().is_none_or(|h| *h != s.hash)
+        (suspect || hash.is_some()) && (hash.is_none() || *hash != s.hash)
     };
 
     match (local.files.get(key), remote.files.get(key), state.get(key)) {
@@ -326,7 +326,7 @@ fn decide<'k>(
                 (true, false) => plan.actions.push(copy(Side::Local, l)),
                 (false, true) => plan.actions.push(copy(Side::Remote, r)),
                 (true, true) => match (lh, rh) {
-                    (Some(lh), Some(rh)) if lh == rh => plan.actions.push(record(lh, l, r)),
+                    (Some(lh), Some(rh)) if lh == rh => plan.actions.push(record(Some(lh), l, r)),
                     _ => plan
                         .conflicts
                         .push(conflict(ConflictKind::BothEdited, Some(l), Some(r))),
@@ -335,9 +335,9 @@ fn decide<'k>(
         }
 
         (Some(l), Some(r), None) => match (lh, rh) {
-            (Some(lh), Some(rh)) if lh == rh => plan.actions.push(record(lh, l, r)),
-            // Only a trusted pair is hashed on the local side alone.
-            (Some(lh), None) => plan.actions.push(record(lh, l, r)),
+            (Some(lh), Some(rh)) if lh == rh => plan.actions.push(record(Some(lh), l, r)),
+            // Equal sizes are read unless the pair was trusted.
+            (None, None) if l.size == r.size => plan.actions.push(record(None, l, r)),
             _ => plan
                 .conflicts
                 .push(conflict(ConflictKind::BothNew, Some(l), Some(r))),
@@ -399,6 +399,16 @@ fn local_resized(l: &Entry, s: &StateRow) -> bool {
 
 fn remote_resized(r: &Entry, s: &StateRow) -> bool {
     r.size != s.remote_size
+}
+
+/// A suspect side is taken as changed without reading it when it was resized,
+/// or when no hash was recorded to compare it with.
+fn local_settled(l: &Entry, s: &StateRow) -> bool {
+    local_resized(l, s) || s.hash.is_none()
+}
+
+fn remote_settled(r: &Entry, s: &StateRow) -> bool {
+    remote_resized(r, s) || s.hash.is_none()
 }
 
 /// Hashes files on the real filesystem.
@@ -469,7 +479,7 @@ mod tests {
                     p.to_string(),
                     StateRow {
                         rel_path: p.to_string(),
-                        hash: h.to_string(),
+                        hash: Some(h.to_string()),
                         local_size: *ls,
                         local_mtime: *lm,
                         remote_size: *rs,
@@ -679,7 +689,7 @@ mod tests {
             plan.actions,
             vec![Action::RecordState {
                 rel_path: "a.txt".into(),
-                hash: "h1".into(),
+                hash: Some("h1".into()),
                 local: Stat {
                     size: 10,
                     mtime: 900
@@ -704,7 +714,7 @@ mod tests {
             plan.actions,
             vec![Action::RecordState {
                 rel_path: "a.txt".into(),
-                hash: "h9".into(),
+                hash: Some("h9".into()),
                 local: Stat {
                     size: 20,
                     mtime: 900
@@ -762,7 +772,7 @@ mod tests {
             plan.actions,
             vec![Action::RecordState {
                 rel_path: "a.txt".into(),
-                hash: "hX".into(),
+                hash: Some("hX".into()),
                 local: Stat {
                     size: 10,
                     mtime: 100
@@ -793,18 +803,17 @@ mod tests {
     }
 
     #[test]
-    fn new_on_both_sides_with_matching_size_and_mtime_is_adopted_from_the_local_hash() {
-        // The provider has no remote hash, so reading the remote would fail.
+    fn new_on_both_sides_with_matching_size_and_mtime_is_adopted_unread() {
+        // The provider has no hashes, so reading either side would fail.
         let local = scan_of(&[("a.txt", 10, 100)]);
         let remote = scan_of(&[("a.txt", 10, 100)]);
-        let h = hashes(&[(Side::Local, "a.txt", "hL")]);
-        let plan = plan_of(&local, &remote, &BTreeMap::new(), &h);
+        let plan = plan_of(&local, &remote, &BTreeMap::new(), &no_hashes());
         assert!(plan.conflicts.is_empty(), "got: {:?}", plan.conflicts);
         assert_eq!(
             plan.actions,
             vec![Action::RecordState {
                 rel_path: "a.txt".into(),
-                hash: "hL".into(),
+                hash: None,
                 local: Stat {
                     size: 10,
                     mtime: 100
@@ -818,12 +827,64 @@ mod tests {
     }
 
     #[test]
-    fn a_trusted_pair_counts_as_one_comparison() {
+    fn a_trusted_pair_is_not_compared() {
         let local = scan_of(&[("a.txt", 10, 100)]);
         let remote = scan_of(&[("a.txt", 10, 100)]);
-        let h = hashes(&[(Side::Local, "a.txt", "hL")]);
-        let events = events_of(&local, &remote, &BTreeMap::new(), &h);
-        assert_eq!(compare_total(&events), Some(1));
+        let events = events_of(&local, &remote, &BTreeMap::new(), &no_hashes());
+        assert_eq!(compare_total(&events), Some(0));
+    }
+
+    /// A row recorded for a trusted pair: no hash, both sides at size 10.
+    fn unhashed_state() -> BTreeMap<String, StateRow> {
+        let mut state = state_of(&[("a.txt", "", 10, 100, 10, 100)]);
+        state.get_mut("a.txt").unwrap().hash = None;
+        state
+    }
+
+    #[test]
+    fn an_unhashed_row_unchanged_on_both_sides_produces_nothing() {
+        let local = scan_of(&[("a.txt", 10, 100)]);
+        let remote = scan_of(&[("a.txt", 10, 100)]);
+        let plan = plan_of(&local, &remote, &unhashed_state(), &no_hashes());
+        assert!(plan.actions.is_empty() && plan.conflicts.is_empty());
+    }
+
+    #[test]
+    fn an_unhashed_row_takes_a_touched_side_as_edited_without_reading_it() {
+        let local = scan_of(&[("a.txt", 10, 500)]);
+        let remote = scan_of(&[("a.txt", 10, 100)]);
+        let plan = plan_of(&local, &remote, &unhashed_state(), &no_hashes());
+        assert_eq!(
+            plan.actions,
+            vec![Action::Copy {
+                rel_path: "a.txt".into(),
+                from: Side::Local,
+                size: 10,
+            }]
+        );
+    }
+
+    #[test]
+    fn an_unhashed_row_touched_on_both_sides_compares_the_two_copies() {
+        let local = scan_of(&[("a.txt", 10, 500)]);
+        let remote = scan_of(&[("a.txt", 10, 501)]);
+        let h = hashes(&[(Side::Local, "a.txt", "hX"), (Side::Remote, "a.txt", "hX")]);
+        let plan = plan_of(&local, &remote, &unhashed_state(), &h);
+        assert!(plan.conflicts.is_empty(), "got: {:?}", plan.conflicts);
+        assert!(matches!(
+            &plan.actions[..],
+            [Action::RecordState { hash: Some(h), .. }] if h == "hX"
+        ));
+    }
+
+    #[test]
+    fn an_unhashed_row_touched_locally_and_deleted_remotely_is_a_conflict() {
+        let local = scan_of(&[("a.txt", 10, 500)]);
+        let plan = plan_of(&local, &Scan::default(), &unhashed_state(), &no_hashes());
+        assert_eq!(
+            plan.conflicts[0].kind,
+            ConflictKind::EditedLocalDeletedRemote
+        );
     }
 
     #[test]

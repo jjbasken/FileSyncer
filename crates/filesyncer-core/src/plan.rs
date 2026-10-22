@@ -25,7 +25,8 @@ pub enum Action {
     },
     RecordState {
         rel_path: String,
-        hash: String,
+        /// `None` when the pair was trusted on size and mtime unread.
+        hash: Option<String>,
         local: Stat,
         remote: Stat,
     },
@@ -195,7 +196,7 @@ mod tests {
                 },
                 Action::RecordState {
                     rel_path: "b".into(),
-                    hash: "h".into(),
+                    hash: Some("h".into()),
                     local: Stat { size: 1, mtime: 2 },
                     remote: Stat { size: 1, mtime: 3 },
                 },
