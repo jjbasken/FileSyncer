@@ -331,3 +331,28 @@ fn a_thousand_files_converge_and_then_settle() {
         "large tree must also be idempotent"
     );
 }
+
+#[test]
+fn verification_rechecks_a_pair_previously_adopted_by_quick_sync() {
+    let w = world();
+    w.write(w.local("a.txt"), "alpha");
+    w.write(w.remote("a.txt"), "bravo");
+    let stamp = filetime::FileTime::from_unix_time(1_600_000_000, 0);
+    filetime::set_file_mtime(w.local("a.txt"), stamp).unwrap();
+    filetime::set_file_mtime(w.remote("a.txt"), stamp).unwrap();
+    let session = w.session();
+    let quick = prepared(&session, false);
+    assert!(quick.conflicts.is_empty());
+    assert_eq!(quick.actions.len(), 1);
+    session.run(&quick, &Reporter::silent()).unwrap();
+    drop(session);
+
+    let plan = w
+        .session()
+        .prepare(false, filesyncer_core::Compare::Verify, &Reporter::silent())
+        .unwrap()
+        .unwrap();
+    assert_eq!(plan.copy_count(Side::Local), 1);
+    assert_eq!(std::fs::read_to_string(w.local("a.txt")).unwrap(), "alpha");
+    assert_eq!(std::fs::read_to_string(w.remote("a.txt")).unwrap(), "bravo");
+}

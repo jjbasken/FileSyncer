@@ -23,8 +23,8 @@ pub enum Command {
         /// Proceed even if the deletion threshold is exceeded.
         #[arg(long)]
         force: bool,
-        /// Read both copies of a file that is new on both sides, rather than
-        /// trusting a matching size and modification time.
+        /// Read paired and tracked files in full, even when size and
+        /// modification time match the saved state.
         #[arg(long)]
         verify: bool,
     },

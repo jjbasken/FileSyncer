@@ -11,7 +11,7 @@ use std::sync::mpsc;
 /// seeking between files and a network share gains little more overlap.
 const MAX_HASH_THREADS: usize = 8;
 
-/// How a path that is on both sides with nothing recorded is compared.
+/// Whether content comparisons may trust recorded metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Compare {
     /// Equal size and mtime are taken as equal content, as rsync does by
@@ -19,7 +19,8 @@ pub enum Compare {
     /// on a first sync against a slow share that skips reading the share.
     #[default]
     Quick,
-    /// Both copies are read in full whenever their sizes match.
+    /// Read every existing copy of paired or tracked files, even when its
+    /// metadata matches the saved state.
     Verify,
 }
 
@@ -209,6 +210,15 @@ fn needs(
     if local.dirs.contains(key) || remote.dirs.contains(key) {
         return Needs::NONE;
     }
+    if compare == Compare::Verify
+        && (state.contains_key(key)
+            || (local.files.contains_key(key) && remote.files.contains_key(key)))
+    {
+        return Needs {
+            local: local.files.contains_key(key),
+            remote: remote.files.contains_key(key),
+        };
+    }
     match (local.files.get(key), remote.files.get(key), state.get(key)) {
         (Some(l), Some(r), Some(s)) => match (local_suspect(l, s), remote_suspect(r, s)) {
             (false, false) => Needs::NONE,
@@ -300,7 +310,7 @@ fn decide<'k>(
     };
     // A suspect side with no hash was resized, which settles it as changed.
     let changed = |suspect: bool, hash: &Option<String>, s: &StateRow| {
-        suspect && hash.as_ref().is_none_or(|h| *h != s.hash)
+        (suspect || hash.is_some()) && hash.as_ref().is_none_or(|h| *h != s.hash)
     };
 
     match (local.files.get(key), remote.files.get(key), state.get(key)) {
@@ -832,6 +842,89 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(plan.conflicts[0].kind, ConflictKind::BothNew);
+    }
+
+    #[test]
+    fn verify_checks_tracked_files_even_when_metadata_is_unchanged() {
+        let local = scan_of(&[("a.txt", 10, 100)]);
+        let remote = scan_of(&[("a.txt", 10, 100)]);
+        let state = state_of(&[("a.txt", "hL", 10, 100, 10, 100)]);
+        for (lh, rh, expected) in [
+            ("hL", "hR", Some(Side::Remote)),
+            ("hR", "hL", Some(Side::Local)),
+            ("hX", "hY", None),
+        ] {
+            let h = hashes(&[(Side::Local, "a.txt", lh), (Side::Remote, "a.txt", rh)]);
+            let plan = reconcile(
+                &local,
+                &remote,
+                &state,
+                &h,
+                Compare::Verify,
+                &Reporter::silent(),
+            )
+            .unwrap()
+            .unwrap();
+            if let Some(from) = expected {
+                assert_eq!(
+                    plan.actions,
+                    vec![Action::Copy {
+                        rel_path: "a.txt".into(),
+                        from,
+                        size: 10,
+                    }]
+                );
+            } else {
+                assert_eq!(plan.conflicts[0].kind, ConflictKind::BothEdited);
+            }
+        }
+    }
+
+    #[test]
+    fn verify_records_a_new_shared_hash_with_unchanged_metadata() {
+        let scan = scan_of(&[("a.txt", 10, 100)]);
+        let state = state_of(&[("a.txt", "old", 10, 100, 10, 100)]);
+        let h = hashes(&[
+            (Side::Local, "a.txt", "new"),
+            (Side::Remote, "a.txt", "new"),
+        ]);
+        let plan = reconcile(
+            &scan,
+            &scan,
+            &state,
+            &h,
+            Compare::Verify,
+            &Reporter::silent(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(matches!(&plan.actions[0], Action::RecordState { hash, .. } if hash == "new"));
+    }
+
+    #[test]
+    fn verify_prevents_deleting_a_survivor_with_an_unrecorded_edit() {
+        let scan = scan_of(&[("a.txt", 10, 100)]);
+        let state = state_of(&[("a.txt", "old", 10, 100, 10, 100)]);
+        for side in [Side::Local, Side::Remote] {
+            let empty = Scan::default();
+            let (local, remote) = match side {
+                Side::Local => (&scan, &empty),
+                Side::Remote => (&empty, &scan),
+            };
+            let h = hashes(&[(side, "a.txt", "edited")]);
+            let plan = reconcile(
+                local,
+                remote,
+                &state,
+                &h,
+                Compare::Verify,
+                &Reporter::silent(),
+            )
+            .unwrap()
+            .unwrap();
+            assert!(plan.actions.is_empty());
+            assert_eq!(plan.conflicts.len(), 1);
+        }
     }
 
     #[test]

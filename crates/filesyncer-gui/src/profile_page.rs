@@ -16,7 +16,7 @@ pub fn show(aw: &Rc<AppWindow>, profile: &Profile) {
 
     let verify_row = adw::SwitchRow::builder()
         .title("Verify contents")
-        .subtitle("Read both copies of files new on both sides, instead of trusting a matching size and date")
+        .subtitle("Read paired and tracked files in full, even when size and date are unchanged")
         .build();
     group.add(&verify_row);
 
