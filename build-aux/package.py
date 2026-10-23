@@ -123,8 +123,8 @@ def main():
     args.output_dir.mkdir(parents=True, exist_ok=True)
     with (ROOT / "Cargo.toml").open("rb") as file:
         version = tomllib.load(file)["workspace"]["package"]["version"]
-    timestamp = run("git", "log", "-1", "--format=%ct", cwd=ROOT)
-    commit = run("git", "rev-parse", "--short=12", "HEAD", cwd=ROOT)
+    timestamp = run("git", "-c", f"safe.directory={ROOT}", "log", "-1", "--format=%ct", cwd=ROOT)
+    commit = run("git", "-c", f"safe.directory={ROOT}", "rev-parse", "--short=12", "HEAD", cwd=ROOT)
     os.environ.setdefault("SOURCE_DATE_EPOCH", timestamp)
     revision = f"{timestamp}.{commit}"
     with tempfile.TemporaryDirectory(prefix="filesyncer-package-") as directory:
