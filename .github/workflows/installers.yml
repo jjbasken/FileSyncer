@@ -12,8 +12,16 @@ permissions:
 
 jobs:
   deb:
-    name: Debian / Ubuntu (.deb)
-    runs-on: ubuntu-24.04
+    name: Debian / Ubuntu (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -38,13 +46,21 @@ jobs:
           python3 build-aux/package.py deb
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: installer-deb
+          name: installer-deb-${{ matrix.arch }}
           path: dist/*.deb
           if-no-files-found: error
 
   rpm:
-    name: Fedora (.rpm)
-    runs-on: ubuntu-24.04
+    name: Fedora (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     container: fedora:44
     steps:
@@ -63,13 +79,21 @@ jobs:
           python3 build-aux/package.py rpm
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: installer-rpm
+          name: installer-rpm-${{ matrix.arch }}
           path: dist/*.rpm
           if-no-files-found: error
 
   flatpak:
-    name: Flatpak
-    runs-on: ubuntu-24.04
+    name: Flatpak (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     container:
       image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-49
@@ -84,14 +108,15 @@ jobs:
           git -c safe.directory="$GITHUB_WORKSPACE" diff --exit-code -- build-aux/cargo-sources.json
       - uses: flatpak/flatpak-github-actions/flatpak-builder@79327416609af08178ad73b352877e51450790b3 # v6
         with:
-          bundle: FileSyncer-x86_64.flatpak
+          bundle: FileSyncer-${{ matrix.arch }}.flatpak
+          arch: ${{ matrix.arch }}
           manifest-path: build-aux/net.jjbasken.FileSyncer.yml
           upload-artifact: false
           cache: false
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: installer-flatpak
-          path: FileSyncer-x86_64.flatpak
+          name: installer-flatpak-${{ matrix.arch }}
+          path: FileSyncer-${{ matrix.arch }}.flatpak
           if-no-files-found: error
 
   release:
