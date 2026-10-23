@@ -167,7 +167,7 @@ fn cmd_sync(
             EXIT_OK
         });
     }
-    if plan.is_noop() {
+    if plan.actions.is_empty() {
         return Ok(if conflicts_present {
             EXIT_CONFLICTS
         } else {
