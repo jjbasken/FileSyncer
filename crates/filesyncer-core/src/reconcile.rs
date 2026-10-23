@@ -989,7 +989,9 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert!(matches!(&plan.actions[0], Action::RecordState { hash, .. } if hash == "new"));
+        assert!(
+            matches!(&plan.actions[0], Action::RecordState { hash, .. } if hash.as_deref() == Some("new"))
+        );
     }
 
     #[test]

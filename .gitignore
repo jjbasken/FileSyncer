@@ -5,3 +5,9 @@
 # Flatpak build outputs
 /build
 /.flatpak-builder
+
+# Installer outputs
+/dist
+/repo
+/flatpak_app
+*.flatpak

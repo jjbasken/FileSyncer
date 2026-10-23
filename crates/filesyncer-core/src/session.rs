@@ -168,6 +168,22 @@ impl Session {
     }
 
     pub fn run(&self, plan: &Plan, reporter: &Reporter) -> Result<RunSummary> {
+        self.run_with_force(plan, false, reporter)
+    }
+
+    /// Apply the final reviewed plan. Recheck guards after user choices and
+    /// before cleanup or any writes; a mount may have disappeared during review.
+    pub fn run_with_force(
+        &self,
+        plan: &Plan,
+        force: bool,
+        reporter: &Reporter,
+    ) -> Result<RunSummary> {
+        marker::verify_marker(&self.profile.local, &self.profile.id)?;
+        marker::verify_marker(&self.profile.remote, &self.profile.id)?;
+        if !force {
+            plan.check_deletion_threshold(self.state.tracked_count()?)?;
+        }
         let ctx = ApplyCtx {
             local_root: &self.profile.local,
             remote_root: &self.profile.remote,
@@ -396,6 +412,54 @@ mod tests {
         }
         let plan = prepared(&session, true);
         assert_eq!(plan.trash_count(), 10);
+    }
+
+    #[test]
+    fn final_review_choices_cannot_bypass_the_deletion_guard() {
+        let f = fixture();
+        for i in 0..4 {
+            f.write("local", &format!("f{i}.txt"), "keep");
+        }
+        let session = f.session();
+        session
+            .run(&prepared(&session, false), &Reporter::silent())
+            .unwrap();
+        // All pairs were adopted without a hash, so these are edit/delete
+        // conflicts. Resolving them as deletions must still respect the guard.
+        for i in 0..2 {
+            std::fs::remove_file(f.profile.remote.join(format!("f{i}.txt"))).unwrap();
+            f.write("local", &format!("f{i}.txt"), "edited locally");
+        }
+        let mut plan = prepared(&session, false);
+        for i in 0..2 {
+            plan.set_choice(&format!("f{i}.txt"), crate::Choice::Trash(Side::Local))
+                .unwrap();
+        }
+        assert!(matches!(
+            session.run(&plan, &Reporter::silent()),
+            Err(crate::Error::DeletionThreshold { .. })
+        ));
+        assert!(f.profile.local.join("f0.txt").exists());
+        session
+            .run_with_force(&plan, true, &Reporter::silent())
+            .unwrap();
+        assert!(!f.profile.local.join("f0.txt").exists());
+    }
+
+    #[test]
+    fn a_mount_lost_during_review_aborts_before_writes_even_with_force() {
+        let f = fixture();
+        f.write("local", "a.txt", "keep");
+        let session = f.session();
+        let plan = prepared(&session, false);
+        std::fs::remove_file(f.profile.remote.join(marker::MARKER_FILE)).unwrap();
+        assert!(
+            session
+                .run_with_force(&plan, true, &Reporter::silent())
+                .is_err()
+        );
+        assert!(!f.profile.remote.join("a.txt").exists());
+        assert_eq!(session.tracked_count().unwrap(), 0);
     }
 
     #[test]

@@ -68,6 +68,11 @@ pub fn show(aw: &Rc<AppWindow>, session: Rc<Session>, plan: Plan) {
             &adw::StatusPage::builder()
                 .icon_name("object-select-symbolic")
                 .title("Everything is in sync")
+                .description(if review.plan.borrow().actions.is_empty() {
+                    "No changes are needed."
+                } else {
+                    "Save sync state to remember this comparison for the next scan."
+                })
                 .vexpand(true)
                 .build(),
         );
@@ -321,10 +326,12 @@ impl Review {
                 match listed.stat(*side) {
                     Some(stat) => {
                         name.set_label(path);
+                        name.set_tooltip_text(Some(path));
                         detail.set_label(&describe_stat(stat));
                     }
                     None => {
                         name.set_label("");
+                        name.set_tooltip_text(None);
                         detail.set_label("");
                     }
                 }
@@ -358,12 +365,14 @@ impl Review {
                 .child(&icon_label(choice_look(choice).0, choice_text(choice)))
                 .css_classes(vec!["flat".to_string()])
                 .build();
-            let review = self.clone();
+            let review = Rc::downgrade(self);
             let path = path.to_string();
             let popover = popover.clone();
             button.connect_clicked(move |_| {
                 popover.popdown();
-                review.choose(&path, choice);
+                if let Some(review) = review.upgrade() {
+                    review.choose(&path, choice);
+                }
             });
             list.append(&button);
         }
@@ -398,7 +407,12 @@ impl Review {
             text.push_str(&format!(" · {conflicts} {noun} left as is"));
         }
         self.total.set_subtitle(&text);
-        self.apply.set_sensitive(!plan.is_noop());
+        self.apply.set_label(if plan.is_noop() {
+            "Save sync state"
+        } else {
+            "Apply"
+        });
+        self.apply.set_sensitive(!plan.actions.is_empty());
     }
 }
 

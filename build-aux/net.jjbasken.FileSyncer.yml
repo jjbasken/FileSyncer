@@ -38,8 +38,9 @@ modules:
   - name: filesyncer
     buildsystem: simple
     build-commands:
-      - cargo --offline fetch --manifest-path Cargo.toml --verbose
-      - cargo --offline build --release --verbose
+      - cargo --offline fetch --locked --manifest-path Cargo.toml --verbose
+      - cargo --offline test --locked --workspace
+      - cargo --offline build --locked --release --workspace --verbose
       - install -Dm755 target/release/filesyncer -t /app/bin
       - install -Dm755 target/release/filesyncer-gui -t /app/bin
       - install -Dm644 data/net.jjbasken.FileSyncer.desktop
@@ -56,4 +57,7 @@ modules:
           - .flatpak-builder
           - build
           - target
+          - dist
+          - repo
+          - flatpak_app
       - cargo-sources.json

@@ -336,7 +336,7 @@ pub fn apply(plan: &Plan, ctx: &ApplyCtx, reporter: &Reporter) -> Result<RunSumm
                 reporter.bytes(Phase::Apply, bytes_done, total_bytes);
                 if result.is_ok() {
                     let transfer = summary.transfer_mut(from.other());
-                    transfer.bytes += size;
+                    transfer.bytes += in_file;
                     transfer.time += started.elapsed();
                 }
                 result.map(|()| Outcome::Copied)

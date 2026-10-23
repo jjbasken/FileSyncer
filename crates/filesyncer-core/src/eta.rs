@@ -104,10 +104,16 @@ impl Eta {
             } => self.bytes_done = done.min(self.total_bytes),
             Progress::Finished {
                 phase: Phase::Apply,
-                ..
+                count,
             } => {
-                self.items_done = self.total_items;
-                self.bytes_done = self.total_bytes;
+                self.items_done = self
+                    .work_before
+                    .get(count)
+                    .copied()
+                    .unwrap_or(self.total_items);
+                if count >= self.work_before.len() {
+                    self.bytes_done = self.total_bytes;
+                }
             }
             _ => {}
         }
@@ -322,6 +328,24 @@ mod tests {
         let left = eta.remaining(Instant::now());
         assert_eq!((left.items, left.bytes), (0, 0));
         assert_eq!(left.time, Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn cancellation_preserves_the_remaining_work() {
+        let plan = plan_of(vec![
+            record("r"),
+            copy("a", Side::Local, MB),
+            copy("b", Side::Local, 2 * MB),
+            trash("t"),
+        ]);
+        let mut eta = Eta::new(&plan, None, Instant::now());
+        eta.observe(&bytes(MB, 3 * MB));
+        eta.observe(&Progress::Finished {
+            phase: Phase::Apply,
+            count: 2,
+        });
+        let left = eta.remaining(Instant::now());
+        assert_eq!((left.items, left.bytes), (2, 2 * MB));
     }
 
     #[test]

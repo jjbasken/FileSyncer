@@ -189,7 +189,7 @@ fn cmd_sync(
     ));
     let sink = |p| applying.borrow_mut().handle(p);
     let summary = session
-        .run(&plan, &Reporter::new(&sink, &|| false))
+        .run_with_force(&plan, force, &Reporter::new(&sink, &|| false))
         .map_err(|e| e.to_string())?;
 
     print!("{}", render::run_summary(&summary));

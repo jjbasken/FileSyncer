@@ -61,6 +61,34 @@ cargo test --workspace
 
 ## Installing
 
+### Download an installer
+
+Download the `.deb`, `.rpm`, or `.flatpak` installer from
+[GitHub Releases](https://github.com/jjbasken/FileSyncer/releases).
+Installers are built for x86_64. The `.deb` targets Ubuntu 24.04 and compatible
+Debian systems with GTK ≥ 4.10 and libadwaita ≥ 1.5; the `.rpm` targets Fedora 44
+and newer. Flatpak supplies the desktop libraries for other distributions.
+
+```sh
+sudo apt install ./filesyncer_*.deb       # Debian / Ubuntu
+sudo dnf install ./filesyncer-*.rpm       # Fedora
+flatpak install --user ./FileSyncer-x86_64.flatpak
+```
+
+The **Build installers** workflow tests and packages pull requests. Each push to
+`main`, including a merged PR, publishes a release containing all three installers
+and `SHA256SUMS`, only after every build succeeds. It can also be run manually
+from the Actions tab. PR builds appear as downloadable workflow artifacts and do
+not publish releases. Automatic releases start when this workflow is merged.
+Native packages include both the GUI and CLI and use a commit timestamp in their
+version so later builds upgrade earlier ones.
+
+To build native packages locally, first run `cargo build --locked --release
+--workspace`, then `python3 build-aux/package.py deb` (requires `dpkg-dev`) or
+`python3 build-aux/package.py rpm` (requires `rpm-build`). Build each package on
+its target distribution so automatically generated library requirements match
+that system. Packages are written to `dist/`.
+
 ### System / per-user (Makefile)
 
 Installs both binaries, a desktop launcher entry, an icon, and AppStream

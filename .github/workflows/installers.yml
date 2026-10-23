@@ -1,0 +1,126 @@
+name: Build installers
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deb:
+    name: Debian / Ubuntu (.deb)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev libadwaita-1-dev dpkg-dev
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: '1.96.0'
+          components: rustfmt, clippy
+      - name: Check and test
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --locked --workspace --all-targets -- -D warnings
+          cargo test --locked --workspace
+      - name: Build and package
+        run: |
+          cargo build --locked --release --workspace
+          python3 build-aux/package.py deb
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: installer-deb
+          path: dist/*.deb
+          if-no-files-found: error
+
+  rpm:
+    name: Fedora (.rpm)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    container: fedora:44
+    steps:
+      - name: Install build dependencies
+        run: dnf install -y git gcc gcc-c++ curl python3 gtk4-devel libadwaita-devel rpm-build findutils tar gzip
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: '1.96.0'
+      - name: Test, build and package
+        run: |
+          cargo test --locked --workspace
+          cargo build --locked --release --workspace
+          python3 build-aux/package.py rpm
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: installer-rpm
+          path: dist/*.rpm
+          if-no-files-found: error
+
+  flatpak:
+    name: Flatpak
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-49
+      options: --privileged
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Verify vendored dependency list
+        run: |
+          python3 build-aux/gen-cargo-sources.py
+          git -c safe.directory="$GITHUB_WORKSPACE" diff --exit-code -- build-aux/cargo-sources.json
+      - uses: flatpak/flatpak-github-actions/flatpak-builder@79327416609af08178ad73b352877e51450790b3 # v6
+        with:
+          bundle: FileSyncer-x86_64.flatpak
+          manifest-path: build-aux/net.jjbasken.FileSyncer.yml
+          upload-artifact: false
+          cache: false
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: installer-flatpak
+          path: FileSyncer-x86_64.flatpak
+          if-no-files-found: error
+
+  release:
+    name: Publish installers
+    needs: [deb, rpm, flatpak]
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: installer-*
+          path: dist
+          merge-multiple: true
+      - name: Publish a release for this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          BUILD_SHA: ${{ github.sha }}
+        run: |
+          cd dist
+          sha256sum -- *.deb *.rpm *.flatpak > SHA256SUMS
+          tag="build-$BUILD_SHA"
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" --draft --target "$BUILD_SHA" \
+              --title "FileSyncer build ${BUILD_SHA:0:12}" \
+              --notes "Installers built and tested from commit $BUILD_SHA. See the README for installation instructions."
+          fi
+          gh release upload "$tag" --clobber -- *.deb *.rpm *.flatpak SHA256SUMS
+          gh release edit "$tag" --draft=false --latest
