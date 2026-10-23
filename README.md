@@ -14,16 +14,21 @@ Each run follows a **scan → review → apply** cycle:
    detection is two-stage — a file is only hashed (BLAKE3) when its size or
    mtime differs from the recorded state, so an unchanged tree costs no reads.
    A file already present on both sides with nothing recorded (a first sync) is
-   taken as identical when its size and mtime match, and only the local copy is
-   read. Matching timestamps are compared to the second, so different contents
-   with the same size and timestamp can be missed. Pass `--verify` (or turn on
+   taken as identical when its size and mtime match, and neither copy is read.
+   Matching timestamps are compared to the second, so different contents with
+   the same size and timestamp can be missed. Pass `--verify` (or turn on
    *Verify contents*) to read paired and tracked files in full, including files
    whose metadata matches saved state. This also checks previously trusted pairs.
+   A trusted pair has no recorded hash until it is verified or copied, so a
+   change to its mtime alone on one side makes that side count as edited.
 2. **Review** the resulting plan: what will be copied in each direction, what
-   will be trashed, and which paths are in conflict. Nothing has happened yet.
+   will be trashed, and which paths are in conflict, with a total and how long
+   it should take at the speed the previous sync measured in each direction.
+   Nothing has happened yet.
 3. **Apply** the plan. Copies are atomic (temp file + rename), each file's state
    is committed as it completes, and per-file errors are reported without
    aborting the run — so an interrupted sync resumes exactly where it stopped.
+   Progress shows the files, bytes and time left, and the current speed.
 
 Highlights:
 
@@ -55,6 +60,35 @@ cargo test --workspace
 ```
 
 ## Installing
+
+### Download an installer
+
+Download the `.deb`, `.rpm`, or `.flatpak` installer from
+[GitHub Releases](https://github.com/jjbasken/FileSyncer/releases).
+Installers are built for x86_64 and ARM64 (aarch64); select the package for your
+machine. The `.deb` targets Ubuntu 24.04 and compatible
+Debian systems with GTK ≥ 4.10 and libadwaita ≥ 1.5; the `.rpm` targets Fedora 44
+and newer. Flatpak supplies the desktop libraries for other distributions.
+
+```sh
+sudo apt install ./filesyncer_*.deb       # Debian / Ubuntu
+sudo dnf install ./filesyncer-*.rpm       # Fedora
+flatpak install --user ./FileSyncer-x86_64.flatpak # or FileSyncer-aarch64.flatpak
+```
+
+The **Build installers** workflow tests and packages pull requests. Each push to
+`main`, including a merged PR, publishes a release containing all three installers
+and `SHA256SUMS`, only after every build succeeds. It can also be run manually
+from the Actions tab. PR builds appear as downloadable workflow artifacts and do
+not publish releases. Automatic releases start when this workflow is merged.
+Native packages include both the GUI and CLI and use a commit timestamp in their
+version so later builds upgrade earlier ones.
+
+To build native packages locally, first run
+`cargo build --locked --release --workspace`, then `python3 build-aux/package.py deb` (requires `dpkg-dev`) or
+`python3 build-aux/package.py rpm` (requires `rpm-build`). Build each package on
+its target distribution so automatically generated library requirements match
+that system. Packages are written to `dist/`.
 
 ### System / per-user (Makefile)
 

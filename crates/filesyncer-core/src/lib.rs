@@ -1,5 +1,6 @@
 pub mod apply;
 pub mod error;
+pub mod eta;
 pub mod hash;
 pub mod marker;
 pub mod plan;
@@ -10,11 +11,13 @@ pub mod scan;
 pub mod session;
 pub mod state;
 
-pub use apply::{ApplyCtx, RunSummary, apply};
+pub use apply::{ApplyCtx, RunSummary, Transfer, apply};
 pub use error::{Error, Result};
+pub use eta::{Eta, Remaining, approx_duration};
 pub use marker::MARKER_FILE;
 pub use plan::{
-    Action, Conflict, ConflictKind, DELETION_THRESHOLD_PCT, Plan, Side, Skip, SkipReason, Stat,
+    Action, Choice, Conflict, ConflictKind, DELETION_THRESHOLD_PCT, Listed, Plan, Side, Skip,
+    SkipReason, Stat,
 };
 pub use profile::{Profile, ProfileSet};
 pub use progress::{Phase, Progress, Reporter};

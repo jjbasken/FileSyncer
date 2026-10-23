@@ -16,6 +16,9 @@ const COPY_BUF: usize = 256 * 1024;
 /// the next scan rebuilds by hashing (see `apply`).
 const COMMIT_EVERY: usize = 500;
 
+/// The least time between byte counts sent during a copy.
+const BYTES_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// The longest a batch of finished rows may wait to be committed.
 const COMMIT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
@@ -49,6 +52,12 @@ fn temp_path_for(dst: &Path) -> PathBuf {
 /// The hash of the bytes copied is computed in the same pass, so the source is
 /// read once.
 pub fn copy_atomic(src: &Path, dst: &Path) -> Result<Copied> {
+    copy_atomic_reporting(src, dst, &mut |_| {})
+}
+
+/// `copy_atomic`, calling `copied` with the size of each chunk as it is
+/// written.
+fn copy_atomic_reporting(src: &Path, dst: &Path, copied: &mut dyn FnMut(u64)) -> Result<Copied> {
     if let Some(parent) = dst.parent() {
         std::fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
     }
@@ -59,7 +68,7 @@ pub fn copy_atomic(src: &Path, dst: &Path) -> Result<Copied> {
         let mut reader = std::fs::File::open(src).map_err(|e| Error::io(src, e))?;
         let meta = reader.metadata().map_err(|e| Error::io(src, e))?;
         let mut writer = std::fs::File::create(&tmp).map_err(|e| Error::io(&tmp, e))?;
-        let hash = match copy_hashing(&mut reader, &mut writer) {
+        let hash = match copy_hashing(&mut reader, &mut writer, copied) {
             Ok(hash) => hash,
             Err(e) => {
                 let _ = std::fs::remove_file(&tmp);
@@ -104,6 +113,7 @@ impl CopyError {
 fn copy_hashing(
     reader: &mut impl std::io::Read,
     writer: &mut impl std::io::Write,
+    copied: &mut dyn FnMut(u64),
 ) -> std::result::Result<String, CopyError> {
     COPY_BUFFER.with_borrow_mut(|buf| {
         let mut hasher = blake3::Hasher::new();
@@ -116,6 +126,7 @@ fn copy_hashing(
             };
             hasher.update(&buf[..n]);
             writer.write_all(&buf[..n]).map_err(CopyError::Write)?;
+            copied(n as u64);
         }
         Ok(crate::hash::to_hex(hasher))
     })
@@ -183,6 +194,34 @@ pub struct RunSummary {
     pub conflicts: usize,
     pub errors: Vec<(String, String)>,
     pub cancelled: bool,
+    /// Copies that finished into the local side.
+    pub to_local: Transfer,
+    /// Copies that finished into the remote side.
+    pub to_remote: Transfer,
+}
+
+/// Bytes copied in one direction and the time spent copying them, from which
+/// the next plan's duration is estimated.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Transfer {
+    pub bytes: u64,
+    pub time: std::time::Duration,
+}
+
+impl RunSummary {
+    pub fn transfer(&self, to: Side) -> Transfer {
+        match to {
+            Side::Local => self.to_local,
+            Side::Remote => self.to_remote,
+        }
+    }
+
+    fn transfer_mut(&mut self, to: Side) -> &mut Transfer {
+        match to {
+            Side::Local => &mut self.to_local,
+            Side::Remote => &mut self.to_remote,
+        }
+    }
 }
 
 impl ApplyCtx<'_> {
@@ -232,13 +271,20 @@ pub fn apply(plan: &Plan, ctx: &ApplyCtx, reporter: &Reporter) -> Result<RunSumm
 
     let mut done = 0usize;
 
+    // Bytes are counted from the plan's sizes once a copy ends, whether it
+    // succeeded or not, so the count always reaches the total.
+    let total_bytes = plan.copy_bytes(Side::Local) + plan.copy_bytes(Side::Remote);
+    let mut bytes_done = 0u64;
+    let mut bytes_sent = std::time::Instant::now();
+    reporter.bytes(Phase::Apply, 0, total_bytes);
+
     // State rows are written in batches, not one transaction per action. A
     // crash can therefore lose the rows of up to `COMMIT_EVERY` finished
     // actions, but never in a way that loses data: a copied file without a row
-    // is new on both sides with equal content, so the next scan hashes both and
-    // adopts it; a trashed file without its row removed is gone from both
-    // sides and the row is dropped. A clean finish or a cancel commits all; an
-    // error rolls the open batch back as the transaction drops.
+    // is new on both sides with equal content, so the next scan adopts it; a
+    // trashed file without its row removed is gone from both sides and the row
+    // is dropped. A clean finish or a cancel commits all; an error rolls the
+    // open batch back as the transaction drops.
     let mut batch = ctx.state.begin()?;
     let mut pending = 0usize;
     let mut opened = std::time::Instant::now();
@@ -271,8 +317,29 @@ pub fn apply(plan: &Plan, ctx: &ApplyCtx, reporter: &Reporter) -> Result<RunSumm
         pending += 1;
 
         let outcome = match action {
-            Action::Copy { rel_path, from, .. } => {
-                apply_copy(ctx, rel_path, *from).map(|()| Outcome::Copied)
+            Action::Copy {
+                rel_path,
+                from,
+                size,
+            } => {
+                let base = bytes_done;
+                let mut in_file = 0u64;
+                let started = std::time::Instant::now();
+                let result = apply_copy(ctx, rel_path, *from, &mut |n| {
+                    in_file += n;
+                    if bytes_sent.elapsed() >= BYTES_INTERVAL {
+                        bytes_sent = std::time::Instant::now();
+                        reporter.bytes(Phase::Apply, base + in_file.min(*size), total_bytes);
+                    }
+                });
+                bytes_done = base + size;
+                reporter.bytes(Phase::Apply, bytes_done, total_bytes);
+                if result.is_ok() {
+                    let transfer = summary.transfer_mut(from.other());
+                    transfer.bytes += in_file;
+                    transfer.time += started.elapsed();
+                }
+                result.map(|()| Outcome::Copied)
             }
             Action::Trash { rel_path, side } => {
                 move_to_trash(ctx.root(*side), rel_path, &ctx.run_stamp)
@@ -313,13 +380,18 @@ pub fn apply(plan: &Plan, ctx: &ApplyCtx, reporter: &Reporter) -> Result<RunSumm
     Ok(summary)
 }
 
-fn apply_copy(ctx: &ApplyCtx, rel_path: &str, from: Side) -> Result<()> {
+fn apply_copy(
+    ctx: &ApplyCtx,
+    rel_path: &str,
+    from: Side,
+    copied: &mut dyn FnMut(u64),
+) -> Result<()> {
     let src = ctx.root(from).join(rel_path);
     let dst = ctx.root(from.other()).join(rel_path);
     let Copied {
         hash,
         source: src_stat,
-    } = copy_atomic(&src, &dst)?;
+    } = copy_atomic_reporting(&src, &dst, copied)?;
     let dst_stat = stat_of_file(&dst)?;
     let (local, remote) = match from {
         Side::Local => (src_stat, dst_stat),
@@ -328,7 +400,7 @@ fn apply_copy(ctx: &ApplyCtx, rel_path: &str, from: Side) -> Result<()> {
 
     ctx.state.upsert(&StateRow {
         rel_path: rel_path.to_string(),
-        hash,
+        hash: Some(hash),
         local_size: local.size,
         local_mtime: local.mtime,
         remote_size: remote.size,
@@ -571,7 +643,7 @@ mod tests {
         let row = &f.state.load_all().unwrap()["a.txt"];
         assert_eq!(
             row.hash,
-            crate::hash::hash_file(&f.local.join("a.txt")).unwrap()
+            Some(crate::hash::hash_file(&f.local.join("a.txt")).unwrap())
         );
         assert_eq!(row.local_size, 7);
         assert_eq!(row.remote_size, 7);
@@ -628,9 +700,9 @@ mod tests {
         let row = &f.state.load_all().unwrap()["a.txt"];
         assert_eq!(
             row.hash,
-            crate::hash::hash_file(&f.local.join("a.txt")).unwrap()
+            Some(crate::hash::hash_file(&f.local.join("a.txt")).unwrap())
         );
-        assert!(!row.hash.is_empty());
+        assert!(row.hash.as_ref().is_some_and(|h| !h.is_empty()));
     }
 
     #[test]
@@ -640,7 +712,7 @@ mod tests {
         f.state
             .upsert(&StateRow {
                 rel_path: "a.txt".into(),
-                hash: "h".into(),
+                hash: Some("h".into()),
                 local_size: 3,
                 local_mtime: 1,
                 remote_size: 3,
@@ -672,7 +744,7 @@ mod tests {
         let plan = Plan {
             actions: vec![Action::RecordState {
                 rel_path: "a.txt".into(),
-                hash: "h9".into(),
+                hash: Some("h9".into()),
                 local: Stat {
                     size: 20,
                     mtime: 900,
@@ -687,7 +759,7 @@ mod tests {
         let summary = run(&plan, &f);
         assert_eq!(summary.copied, 0);
         let row = &f.state.load_all().unwrap()["a.txt"];
-        assert_eq!(row.hash, "h9");
+        assert_eq!(row.hash.as_deref(), Some("h9"));
         assert_eq!(row.remote_mtime, 901);
     }
 
@@ -697,7 +769,7 @@ mod tests {
         f.state
             .upsert(&StateRow {
                 rel_path: "a.txt".into(),
-                hash: "h".into(),
+                hash: Some("h".into()),
                 local_size: 1,
                 local_mtime: 1,
                 remote_size: 1,
@@ -835,6 +907,62 @@ mod tests {
         assert!(events.iter().any(|e| matches!(
             e, Progress::Item { rel_path, .. } if rel_path == "a.txt"
         )));
+    }
+
+    #[test]
+    fn bytes_count_up_to_the_total_including_a_failed_copy() {
+        let f = fixture();
+        f.write_local("a.txt", "one");
+        let plan = Plan {
+            actions: vec![
+                Action::Copy {
+                    rel_path: "a.txt".into(),
+                    from: Side::Local,
+                    size: 3,
+                },
+                Action::Copy {
+                    rel_path: "missing.txt".into(),
+                    from: Side::Remote,
+                    size: 5,
+                },
+            ],
+            ..Default::default()
+        };
+        let events = std::cell::RefCell::new(Vec::new());
+        let sink = |p| events.borrow_mut().push(p);
+        let summary = apply(&plan, &f.ctx(), &Reporter::new(&sink, &|| false)).unwrap();
+
+        let counts: Vec<(u64, u64)> = events
+            .into_inner()
+            .into_iter()
+            .filter_map(|e| match e {
+                Progress::Bytes { done, total, .. } => Some((done, total)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(counts.first(), Some(&(0, 8)));
+        assert_eq!(counts.last(), Some(&(8, 8)));
+        assert!(counts.windows(2).all(|w| w[0].0 <= w[1].0));
+
+        // Only the copy that finished is measured.
+        assert_eq!(summary.to_remote.bytes, 3);
+        assert_eq!(summary.to_local, Transfer::default());
+    }
+
+    #[test]
+    fn transfer_rate_samples_use_actual_bytes_when_the_source_size_changed() {
+        let f = fixture();
+        f.write_local("a.txt", "larger than scanned");
+        let plan = Plan {
+            actions: vec![Action::Copy {
+                rel_path: "a.txt".into(),
+                from: Side::Local,
+                size: 1,
+            }],
+            ..Default::default()
+        };
+        let summary = run(&plan, &f);
+        assert_eq!(summary.to_remote.bytes, 19);
     }
 
     #[test]

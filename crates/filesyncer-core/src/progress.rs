@@ -38,6 +38,13 @@ pub enum Progress {
         index: usize,
         rel_path: String,
     },
+    /// Bytes of file content transferred so far in the phase, out of `total`.
+    /// Sent between items too, so a long copy shows movement.
+    Bytes {
+        phase: Phase,
+        done: u64,
+        total: u64,
+    },
     Finished {
         phase: Phase,
         count: usize,
@@ -84,6 +91,10 @@ impl<'a> Reporter<'a> {
             index,
             rel_path: rel_path.to_string(),
         });
+    }
+
+    pub fn bytes(&self, phase: Phase, done: u64, total: u64) {
+        (self.progress)(Progress::Bytes { phase, done, total });
     }
 
     pub fn finished(&self, phase: Phase, count: usize) {
