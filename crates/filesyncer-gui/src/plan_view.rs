@@ -367,9 +367,11 @@ impl Review {
                 .build();
             let review = Rc::downgrade(self);
             let path = path.to_string();
-            let popover = popover.clone();
+            let popover = popover.downgrade();
             button.connect_clicked(move |_| {
-                popover.popdown();
+                if let Some(popover) = popover.upgrade() {
+                    popover.popdown();
+                }
                 if let Some(review) = review.upgrade() {
                     review.choose(&path, choice);
                 }

@@ -38,8 +38,8 @@ jobs:
       - name: Check and test
         run: |
           cargo fmt --all -- --check
-          cargo clippy --locked --workspace --all-targets -- -D warnings
-          cargo test --locked --workspace
+          cargo clippy --locked --release --workspace --all-targets -- -D warnings
+          cargo test --locked --release --workspace
       - name: Build and package
         run: |
           cargo build --locked --release --workspace
@@ -74,7 +74,7 @@ jobs:
           toolchain: '1.96.0'
       - name: Test, build and package
         run: |
-          cargo test --locked --workspace
+          cargo test --locked --release --workspace
           cargo build --locked --release --workspace
           python3 build-aux/package.py rpm
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

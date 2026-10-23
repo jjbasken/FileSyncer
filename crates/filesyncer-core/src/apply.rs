@@ -950,6 +950,22 @@ mod tests {
     }
 
     #[test]
+    fn transfer_rate_samples_use_actual_bytes_when_the_source_size_changed() {
+        let f = fixture();
+        f.write_local("a.txt", "larger than scanned");
+        let plan = Plan {
+            actions: vec![Action::Copy {
+                rel_path: "a.txt".into(),
+                from: Side::Local,
+                size: 1,
+            }],
+            ..Default::default()
+        };
+        let summary = run(&plan, &f);
+        assert_eq!(summary.to_remote.bytes, 19);
+    }
+
+    #[test]
     fn unresolved_conflicts_are_counted_and_never_acted_on() {
         let f = fixture();
         f.write_local("a.txt", "local");
