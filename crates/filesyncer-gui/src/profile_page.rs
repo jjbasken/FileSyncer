@@ -1,7 +1,7 @@
 use crate::scan_view;
 use crate::window::AppWindow;
 use adw::prelude::*;
-use filesyncer_core::{Profile, Session};
+use filesyncer_core::{Compare, Profile, Session};
 use std::rc::Rc;
 
 pub fn show(aw: &Rc<AppWindow>, profile: &Profile) {
@@ -13,6 +13,12 @@ pub fn show(aw: &Rc<AppWindow>, profile: &Profile) {
 
     let status_row = adw::ActionRow::builder().title("Last synced").build();
     group.add(&status_row);
+
+    let verify_row = adw::SwitchRow::builder()
+        .title("Verify contents")
+        .subtitle("Read paired and tracked files in full, even when size and date are unchanged")
+        .build();
+    group.add(&verify_row);
 
     let scan_button = gtk::Button::builder()
         .label("Scan")
@@ -48,7 +54,14 @@ pub fn show(aw: &Rc<AppWindow>, profile: &Profile) {
             let aw2 = aw.clone();
             // The scan page is the feedback, so the button needs no busy state
             // of its own: it is gone from the screen the moment it is pressed.
-            scan_button.connect_clicked(move |_| scan_view::show(&aw2, session.clone()));
+            scan_button.connect_clicked(move |_| {
+                let compare = if verify_row.is_active() {
+                    Compare::Verify
+                } else {
+                    Compare::Quick
+                };
+                scan_view::show(&aw2, session.clone(), compare)
+            });
         }
         Err(e) => {
             scan_button.set_sensitive(false);

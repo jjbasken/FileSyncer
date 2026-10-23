@@ -105,17 +105,27 @@ fn render(aw: &Rc<AppWindow>, session: Rc<Session>, plan: Rc<RefCell<Plan>>) {
                 &adw::StatusPage::builder()
                     .icon_name("object-select-symbolic")
                     .title("Everything is in sync")
+                    .description(if p.actions.is_empty() {
+                        "No changes are needed."
+                    } else {
+                        "Save sync state to remember this comparison for the next scan."
+                    })
                     .build(),
             );
         }
     }
 
     let cancel = gtk::Button::with_label("Cancel");
+    let state_only = plan.borrow().is_noop();
     let apply = gtk::Button::builder()
-        .label("Apply")
+        .label(if state_only {
+            "Save sync state"
+        } else {
+            "Apply"
+        })
         .css_classes(vec!["suggested-action".to_string()])
         .build();
-    apply.set_sensitive(!plan.borrow().is_noop());
+    apply.set_sensitive(!plan.borrow().actions.is_empty());
 
     let buttons = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)

@@ -11,6 +11,19 @@ use std::sync::mpsc;
 /// seeking between files and a network share gains little more overlap.
 const MAX_HASH_THREADS: usize = 8;
 
+/// Whether content comparisons may trust recorded metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Compare {
+    /// Equal size and mtime are taken as equal content, as rsync does by
+    /// default. Only the local copy is read, for the hash the state records;
+    /// on a first sync against a slow share that skips reading the share.
+    #[default]
+    Quick,
+    /// Read every existing copy of paired or tracked files, even when its
+    /// metadata matches the saved state.
+    Verify,
+}
+
 /// Supplies content hashes on demand. Injected so the decision logic itself
 /// performs no I/O and every branch is testable without a filesystem.
 ///
@@ -64,6 +77,7 @@ pub fn reconcile(
     remote: &Scan,
     state: &BTreeMap<String, StateRow>,
     hashes: &dyn HashProvider,
+    compare: Compare,
     reporter: &Reporter,
 ) -> Result<Option<Plan>> {
     let mut plan = Plan::default();
@@ -84,7 +98,7 @@ pub fn reconcile(
     let jobs: Vec<(&str, Needs)> = keys
         .iter()
         .filter_map(|&key| {
-            let needs = needs(key, local, remote, state);
+            let needs = needs(key, local, remote, state, compare);
             needs.any().then_some((key, needs))
         })
         .collect();
@@ -181,13 +195,29 @@ fn hash_all<'k>(
 ///
 /// This function alone chooses between reading a file and settling the path
 /// from its size: `hash_all` reads exactly what it names, and `decide` reads
-/// a missing hash as "resized, so changed". A size that differs from the recorded one proves the content
+/// a missing hash as "resized, so changed", or for a pair with nothing
+/// recorded, as "trusted on size and mtime". A size that differs from the recorded one proves the content
 /// changed (the recorded hash was taken of a file of the recorded size); a
 /// changed mtime alone does not.
-fn needs(key: &str, local: &Scan, remote: &Scan, state: &BTreeMap<String, StateRow>) -> Needs {
+fn needs(
+    key: &str,
+    local: &Scan,
+    remote: &Scan,
+    state: &BTreeMap<String, StateRow>,
+    compare: Compare,
+) -> Needs {
     // A type mismatch is settled without reading either file.
     if local.dirs.contains(key) || remote.dirs.contains(key) {
         return Needs::NONE;
+    }
+    if compare == Compare::Verify
+        && (state.contains_key(key)
+            || (local.files.contains_key(key) && remote.files.contains_key(key)))
+    {
+        return Needs {
+            local: local.files.contains_key(key),
+            remote: remote.files.contains_key(key),
+        };
     }
     match (local.files.get(key), remote.files.get(key), state.get(key)) {
         (Some(l), Some(r), Some(s)) => match (local_suspect(l, s), remote_suspect(r, s)) {
@@ -210,11 +240,17 @@ fn needs(key: &str, local: &Scan, remote: &Scan, state: &BTreeMap<String, StateR
                 remote: !remote_resized(r, s) || l.size == r.size,
             },
         },
-        // Nothing recorded: only equal sizes can be equal content.
-        (Some(l), Some(r), None) => Needs {
-            local: l.size == r.size,
-            remote: l.size == r.size,
-        },
+        // Nothing recorded: only equal sizes can be equal content. A pair whose
+        // mtimes match too is trusted unless verifying, and only the local
+        // copy is read, for the hash to record.
+        (Some(l), Some(r), None) => {
+            let same_size = l.size == r.size;
+            let trusted = compare == Compare::Quick && same_size && l.mtime == r.mtime;
+            Needs {
+                local: same_size,
+                remote: same_size && !trusted,
+            }
+        }
         (Some(l), None, Some(s)) => Needs {
             local: local_suspect(l, s) && !local_resized(l, s),
             remote: false,
@@ -274,7 +310,7 @@ fn decide<'k>(
     };
     // A suspect side with no hash was resized, which settles it as changed.
     let changed = |suspect: bool, hash: &Option<String>, s: &StateRow| {
-        suspect && hash.as_ref().is_none_or(|h| *h != s.hash)
+        (suspect || hash.is_some()) && hash.as_ref().is_none_or(|h| *h != s.hash)
     };
 
     match (local.files.get(key), remote.files.get(key), state.get(key)) {
@@ -300,6 +336,8 @@ fn decide<'k>(
 
         (Some(l), Some(r), None) => match (lh, rh) {
             (Some(lh), Some(rh)) if lh == rh => plan.actions.push(record(lh, l, r)),
+            // Only a trusted pair is hashed on the local side alone.
+            (Some(lh), None) => plan.actions.push(record(lh, l, r)),
             _ => plan
                 .conflicts
                 .push(conflict(ConflictKind::BothNew, Some(l), Some(r))),
@@ -463,9 +501,16 @@ mod tests {
         state: &BTreeMap<String, StateRow>,
         hashes: &dyn HashProvider,
     ) -> Plan {
-        reconcile(local, remote, state, hashes, &Reporter::silent())
-            .unwrap()
-            .expect("a silent reporter never cancels")
+        reconcile(
+            local,
+            remote,
+            state,
+            hashes,
+            Compare::Quick,
+            &Reporter::silent(),
+        )
+        .unwrap()
+        .expect("a silent reporter never cancels")
     }
 
     /// The events a reconciliation emits, for the progress tests.
@@ -482,6 +527,7 @@ mod tests {
             remote,
             state,
             hashes,
+            Compare::Quick,
             &Reporter::new(&sink, &|| false),
         )
         .unwrap();
@@ -744,6 +790,153 @@ mod tests {
         let remote = scan_of(&[("a.txt", 11, 200)]);
         let plan = plan_of(&local, &remote, &BTreeMap::new(), &no_hashes());
         assert_eq!(plan.conflicts[0].kind, ConflictKind::BothNew);
+    }
+
+    #[test]
+    fn new_on_both_sides_with_matching_size_and_mtime_is_adopted_from_the_local_hash() {
+        // The provider has no remote hash, so reading the remote would fail.
+        let local = scan_of(&[("a.txt", 10, 100)]);
+        let remote = scan_of(&[("a.txt", 10, 100)]);
+        let h = hashes(&[(Side::Local, "a.txt", "hL")]);
+        let plan = plan_of(&local, &remote, &BTreeMap::new(), &h);
+        assert!(plan.conflicts.is_empty(), "got: {:?}", plan.conflicts);
+        assert_eq!(
+            plan.actions,
+            vec![Action::RecordState {
+                rel_path: "a.txt".into(),
+                hash: "hL".into(),
+                local: Stat {
+                    size: 10,
+                    mtime: 100
+                },
+                remote: Stat {
+                    size: 10,
+                    mtime: 100
+                },
+            }]
+        );
+    }
+
+    #[test]
+    fn a_trusted_pair_counts_as_one_comparison() {
+        let local = scan_of(&[("a.txt", 10, 100)]);
+        let remote = scan_of(&[("a.txt", 10, 100)]);
+        let h = hashes(&[(Side::Local, "a.txt", "hL")]);
+        let events = events_of(&local, &remote, &BTreeMap::new(), &h);
+        assert_eq!(compare_total(&events), Some(1));
+    }
+
+    #[test]
+    fn verifying_reads_both_copies_despite_matching_size_and_mtime() {
+        let local = scan_of(&[("a.txt", 10, 100)]);
+        let remote = scan_of(&[("a.txt", 10, 100)]);
+        let h = hashes(&[(Side::Local, "a.txt", "hL"), (Side::Remote, "a.txt", "hR")]);
+        let plan = reconcile(
+            &local,
+            &remote,
+            &BTreeMap::new(),
+            &h,
+            Compare::Verify,
+            &Reporter::silent(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(plan.conflicts[0].kind, ConflictKind::BothNew);
+    }
+
+    #[test]
+    fn verify_checks_tracked_files_even_when_metadata_is_unchanged() {
+        let local = scan_of(&[("a.txt", 10, 100)]);
+        let remote = scan_of(&[("a.txt", 10, 100)]);
+        let state = state_of(&[("a.txt", "hL", 10, 100, 10, 100)]);
+        for (lh, rh, expected) in [
+            ("hL", "hR", Some(Side::Remote)),
+            ("hR", "hL", Some(Side::Local)),
+            ("hX", "hY", None),
+        ] {
+            let h = hashes(&[(Side::Local, "a.txt", lh), (Side::Remote, "a.txt", rh)]);
+            let plan = reconcile(
+                &local,
+                &remote,
+                &state,
+                &h,
+                Compare::Verify,
+                &Reporter::silent(),
+            )
+            .unwrap()
+            .unwrap();
+            if let Some(from) = expected {
+                assert_eq!(
+                    plan.actions,
+                    vec![Action::Copy {
+                        rel_path: "a.txt".into(),
+                        from,
+                        size: 10,
+                    }]
+                );
+            } else {
+                assert_eq!(plan.conflicts[0].kind, ConflictKind::BothEdited);
+            }
+        }
+    }
+
+    #[test]
+    fn verify_records_a_new_shared_hash_with_unchanged_metadata() {
+        let scan = scan_of(&[("a.txt", 10, 100)]);
+        let state = state_of(&[("a.txt", "old", 10, 100, 10, 100)]);
+        let h = hashes(&[
+            (Side::Local, "a.txt", "new"),
+            (Side::Remote, "a.txt", "new"),
+        ]);
+        let plan = reconcile(
+            &scan,
+            &scan,
+            &state,
+            &h,
+            Compare::Verify,
+            &Reporter::silent(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(matches!(&plan.actions[0], Action::RecordState { hash, .. } if hash == "new"));
+    }
+
+    #[test]
+    fn verify_prevents_deleting_a_survivor_with_an_unrecorded_edit() {
+        let scan = scan_of(&[("a.txt", 10, 100)]);
+        let state = state_of(&[("a.txt", "old", 10, 100, 10, 100)]);
+        for side in [Side::Local, Side::Remote] {
+            let empty = Scan::default();
+            let (local, remote) = match side {
+                Side::Local => (&scan, &empty),
+                Side::Remote => (&empty, &scan),
+            };
+            let h = hashes(&[(side, "a.txt", "edited")]);
+            let plan = reconcile(
+                local,
+                remote,
+                &state,
+                &h,
+                Compare::Verify,
+                &Reporter::silent(),
+            )
+            .unwrap()
+            .unwrap();
+            assert!(plan.actions.is_empty());
+            assert_eq!(plan.conflicts.len(), 1);
+        }
+    }
+
+    #[test]
+    fn matching_mtimes_are_not_trusted_once_state_is_recorded() {
+        // Both sides edited to the same new mtime: the recorded state, not the
+        // pair's agreement, decides, so both are still read.
+        let local = scan_of(&[("a.txt", 10, 500)]);
+        let remote = scan_of(&[("a.txt", 10, 500)]);
+        let state = state_of(&[("a.txt", "h1", 10, 100, 10, 200)]);
+        let h = hashes(&[(Side::Local, "a.txt", "hL"), (Side::Remote, "a.txt", "hR")]);
+        let plan = plan_of(&local, &remote, &state, &h);
+        assert_eq!(plan.conflicts[0].kind, ConflictKind::BothEdited);
     }
 
     #[test]
@@ -1089,6 +1282,7 @@ mod tests {
             &Scan::default(),
             &BTreeMap::new(),
             &no_hashes(),
+            Compare::Quick,
             &Reporter::new(&sink, &|| true),
         )
         .unwrap();
@@ -1101,9 +1295,18 @@ mod tests {
         // path and no other.
         let n = 200;
         let names: Vec<String> = (0..n).map(|i| format!("f{i:03}.txt")).collect();
-        let items: Vec<_> = names.iter().map(|p| (p.as_str(), 10, 100)).collect();
-        let local = scan_of(&items);
-        let remote = scan_of(&items);
+        let local = scan_of(
+            &names
+                .iter()
+                .map(|p| (p.as_str(), 10, 100))
+                .collect::<Vec<_>>(),
+        );
+        let remote = scan_of(
+            &names
+                .iter()
+                .map(|p| (p.as_str(), 10, 200))
+                .collect::<Vec<_>>(),
+        );
         // Every third path differs, so a crossed wire changes the plan.
         let table = || {
             let mut table = BTreeMap::new();
@@ -1144,7 +1347,14 @@ mod tests {
         let remote = scan_of(&[("a.txt", 10, 200), ("b.txt", 10, 200)]);
         // b.txt has no hashes, so the provider errors on it.
         let h = hashes(&[(Side::Local, "a.txt", "h"), (Side::Remote, "a.txt", "h")]);
-        let result = reconcile(&local, &remote, &BTreeMap::new(), &h, &Reporter::silent());
+        let result = reconcile(
+            &local,
+            &remote,
+            &BTreeMap::new(),
+            &h,
+            Compare::Quick,
+            &Reporter::silent(),
+        );
         assert!(result.is_err());
     }
 
@@ -1166,6 +1376,7 @@ mod tests {
             &remote,
             &BTreeMap::new(),
             &MapHashProvider(table),
+            Compare::Verify,
             &Reporter::new(&sink, &|| {
                 checks.set(checks.get() + 1);
                 checks.get() > 3

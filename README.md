@@ -13,6 +13,12 @@ Each run follows a **scan → review → apply** cycle:
 1. **Scan** both roots and compare against the last-known state. Change
    detection is two-stage — a file is only hashed (BLAKE3) when its size or
    mtime differs from the recorded state, so an unchanged tree costs no reads.
+   A file already present on both sides with nothing recorded (a first sync) is
+   taken as identical when its size and mtime match, and only the local copy is
+   read. Matching timestamps are compared to the second, so different contents
+   with the same size and timestamp can be missed. Pass `--verify` (or turn on
+   *Verify contents*) to read paired and tracked files in full, including files
+   whose metadata matches saved state. This also checks previously trusted pairs.
 2. **Review** the resulting plan: what will be copied in each direction, what
    will be trashed, and which paths are in conflict. Nothing has happened yet.
 3. **Apply** the plan. Copies are atomic (temp file + rename), each file's state

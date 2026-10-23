@@ -23,6 +23,10 @@ pub enum Command {
         /// Proceed even if the deletion threshold is exceeded.
         #[arg(long)]
         force: bool,
+        /// Read paired and tracked files in full, even when size and
+        /// modification time match the saved state.
+        #[arg(long)]
+        verify: bool,
     },
     /// List configured profiles.
     List,

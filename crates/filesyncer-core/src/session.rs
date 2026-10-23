@@ -3,7 +3,7 @@ use crate::marker;
 use crate::plan::Plan;
 use crate::profile::Profile;
 use crate::progress::{CANCEL_POLL, Phase, Progress, Reporter};
-use crate::reconcile::{FsHashProvider, reconcile};
+use crate::reconcile::{Compare, FsHashProvider, reconcile};
 use crate::scan::{IGNORE_FILE, Scan, scan_root};
 use crate::state::StateStore;
 use crate::{Result, profile};
@@ -44,7 +44,12 @@ impl Session {
     /// plan rather than an `Error` because nothing failed and nothing was
     /// written; an error would force every caller to tell a cancelled scan apart
     /// from a broken one.
-    pub fn prepare(&self, force: bool, reporter: &Reporter) -> Result<Option<Plan>> {
+    pub fn prepare(
+        &self,
+        force: bool,
+        compare: Compare,
+        reporter: &Reporter,
+    ) -> Result<Option<Plan>> {
         marker::verify_marker(&self.profile.local, &self.profile.id)?;
         marker::verify_marker(&self.profile.remote, &self.profile.id)?;
 
@@ -57,7 +62,7 @@ impl Session {
             local_root: self.profile.local.clone(),
             remote_root: self.profile.remote.clone(),
         };
-        let Some(plan) = reconcile(&local, &remote, &state, &hashes, reporter)? else {
+        let Some(plan) = reconcile(&local, &remote, &state, &hashes, compare, reporter)? else {
             return Ok(None);
         };
 
@@ -252,7 +257,7 @@ mod tests {
     /// the resulting plan.
     fn prepared(session: &Session, force: bool) -> Plan {
         session
-            .prepare(force, &Reporter::silent())
+            .prepare(force, Compare::Quick, &Reporter::silent())
             .unwrap()
             .expect("a silent reporter never cancels")
     }
@@ -342,7 +347,9 @@ mod tests {
         for i in 0..10 {
             std::fs::remove_file(f.profile.remote.join(format!("f{i}.txt"))).unwrap();
         }
-        let err = session.prepare(false, &Reporter::silent()).unwrap_err();
+        let err = session
+            .prepare(false, Compare::Quick, &Reporter::silent())
+            .unwrap_err();
         assert!(
             matches!(err, crate::Error::DeletionThreshold { .. }),
             "got: {err:?}"
@@ -400,7 +407,7 @@ mod tests {
         let sink = |_| {};
         let plan = f
             .session()
-            .prepare(false, &Reporter::new(&sink, &|| true))
+            .prepare(false, Compare::Quick, &Reporter::new(&sink, &|| true))
             .unwrap();
         assert!(plan.is_none());
     }
@@ -415,7 +422,7 @@ mod tests {
         let before = (tree(&f.profile.local), tree(&f.profile.remote));
         let sink = |_| {};
         session
-            .prepare(false, &Reporter::new(&sink, &|| true))
+            .prepare(false, Compare::Quick, &Reporter::new(&sink, &|| true))
             .unwrap();
 
         assert_eq!(
@@ -437,7 +444,7 @@ mod tests {
         let events = std::cell::RefCell::new(Vec::new());
         let sink = |p| events.borrow_mut().push(p);
         f.session()
-            .prepare(false, &Reporter::new(&sink, &|| false))
+            .prepare(false, Compare::Quick, &Reporter::new(&sink, &|| false))
             .unwrap()
             .unwrap();
 
@@ -476,7 +483,7 @@ mod tests {
         let sink = |p| events.borrow_mut().push(p);
         let plan = f
             .session()
-            .prepare(false, &Reporter::new(&sink, &|| false))
+            .prepare(false, Compare::Quick, &Reporter::new(&sink, &|| false))
             .unwrap()
             .unwrap();
         assert_eq!(plan.copy_count(crate::Side::Local), n);
@@ -502,7 +509,10 @@ mod tests {
         // read it when it is a directory and reports a configuration error.
         f.write("local", &format!("{IGNORE_FILE}/inner"), "x");
         f.write("local", "a.txt", "x");
-        let err = f.session().prepare(false, &Reporter::silent()).unwrap_err();
+        let err = f
+            .session()
+            .prepare(false, Compare::Quick, &Reporter::silent())
+            .unwrap_err();
         assert!(matches!(err, crate::Error::Config(_)), "got: {err:?}");
     }
 
